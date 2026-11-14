@@ -143,6 +143,8 @@ pub fn update(window: Window, clip: Option<Rect>) -> bool {
     let Some(size) = video::window_size(window) else {
         return false;
     };
+    let size = (video::pixels(size.0), video::pixels(size.1));
+    let clip = clip.map(video::pixels_rect);
     let mut masks = MASKS.lock().unwrap_or_else(|e| e.into_inner());
     let map = masks.get_or_insert_with(HashMap::new);
     let clip = clip.unwrap_or(Rect {

@@ -2111,8 +2111,8 @@ pub mod video {
                     let e: WindowEvent = decode(&raw);
                     Event::WindowResized {
                         window: e.window,
-                        width: e.data1,
-                        height: e.data2,
+                        width: video::points(e.data1),
+                        height: video::points(e.data2),
                     }
                 }
                 event_type::WINDOW_PIXEL_SIZE_CHANGED
@@ -2191,12 +2191,13 @@ pub mod video {
                 }
                 event_type::MOUSE_MOTION => {
                     let e: MouseMotionEvent = decode(&raw);
+                    let s = video::x11_scale();
                     Event::MouseMotion {
                         window: e.window,
-                        x: e.x,
-                        y: e.y,
-                        dx: e.xrel,
-                        dy: e.yrel,
+                        x: e.x / s,
+                        y: e.y / s,
+                        dx: e.xrel / s,
+                        dy: e.yrel / s,
                         buttons: e.state,
                     }
                 }
@@ -2207,8 +2208,8 @@ pub mod video {
                         button: e.button,
                         down: e.down,
                         clicks: e.clicks,
-                        x: e.x,
-                        y: e.y,
+                        x: e.x / video::x11_scale(),
+                        y: e.y / video::x11_scale(),
                     }
                 }
                 event_type::MOUSE_WHEEL => {
@@ -2346,12 +2347,87 @@ pub mod video {
             if *up {
                 // This thread now owns the event queue: see [`super::pump`].
                 super::claim_video_thread();
+                settle_x11_scale();
             }
         }
         *up
     }
 
     static VIDEO_UP: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+    /// X11 gives a window's coordinates in pixels and a pixel density of one,
+    /// where Wayland, like a Mac, gives points and the display's scale. On
+    /// X11 the desktop's scale is its content scale (`Xft.dpi`, `GDK_SCALE`):
+    /// coordinates are divided by it on their way in from SDL and multiplied
+    /// on their way out, and the density is it, so a window is laid out the
+    /// same in points on either. One anywhere else.
+    static X11_SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+
+    pub fn x11_scale() -> f32 {
+        X11_SCALE.get().copied().unwrap_or(1.0)
+    }
+
+    fn settle_x11_scale() {
+        let scale = match is_x11() {
+            true => display_content_scale(primary_display()),
+            false => 1.0,
+        };
+        let _ = X11_SCALE.set(if scale.is_finite() && scale > 0.0 { scale } else { 1.0 });
+    }
+
+    /// Pixels to points, for a coordinate SDL gives.
+    pub(crate) fn points(v: i32) -> i32 {
+        let s = x11_scale();
+        if s == 1.0 { v } else { (v as f32 / s).round() as i32 }
+    }
+
+    /// Points to pixels, for a coordinate SDL takes.
+    pub(crate) fn pixels(v: i32) -> i32 {
+        let s = x11_scale();
+        if s == 1.0 { v } else { (v as f32 * s).round() as i32 }
+    }
+
+    fn points_rect(r: Rect) -> Rect {
+        Rect { x: points(r.x), y: points(r.y), w: points(r.w), h: points(r.h) }
+    }
+
+    pub(crate) fn pixels_rect(r: Rect) -> Rect {
+        Rect { x: pixels(r.x), y: pixels(r.y), w: pixels(r.w), h: pixels(r.h) }
+    }
+
+    fn points_mode(mut mode: DisplayMode) -> DisplayMode {
+        let s = x11_scale();
+        if s != 1.0 {
+            mode.w = points(mode.w);
+            mode.h = points(mode.h);
+            mode.pixel_density *= s;
+        }
+        mode
+    }
+
+    static HIT_TESTS: std::sync::Mutex<Vec<(usize, HitTest)>> = std::sync::Mutex::new(Vec::new());
+
+    /// SDL's hit test asks in pixels on X11; the callback answers in points.
+    unsafe extern "C" fn hit_test_in_points(
+        window: Window,
+        at: *const Point,
+        data: *mut c_void,
+    ) -> HitTestResult {
+        let callback = HIT_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(w, _)| *w == window as usize)
+            .map(|(_, c)| *c);
+        let Some(callback) = callback else {
+            return HitTestResult::Normal;
+        };
+        // SAFETY: SDL passes a live point for the call.
+        let at = unsafe { *at };
+        let point = Point { x: points(at.x), y: points(at.y) };
+        // SAFETY: the callback the caller installed, with a point in its units.
+        unsafe { callback(window, &point, data) }
+    }
 
     /// Whether the video subsystem is running.
     pub fn video_up() -> bool {
@@ -3248,7 +3324,7 @@ pub mod video {
         let title = title_override().unwrap_or(title);
         let create = api()?.SDL_CreateWindow?;
         // SAFETY: a NUL-terminated title and SDL's own flags.
-        let window = unsafe { create(title.as_ptr(), width, height, flags) };
+        let window = unsafe { create(title.as_ptr(), pixels(width), pixels(height), flags) };
         if window.is_null() {
             return None;
         }
@@ -3282,7 +3358,9 @@ pub mod video {
         }
         // SAFETY: the live registry prevents logical parent teardown until
         // the child has been inserted.
-        let window = unsafe { create(parent, offset_x, offset_y, width, height, flags) };
+        let window = unsafe {
+            create(parent, pixels(offset_x), pixels(offset_y), pixels(width), pixels(height), flags)
+        };
         if window.is_null() {
             return None;
         }
@@ -3407,8 +3485,9 @@ pub mod video {
         let Some(f) = api().and_then(|a| a.SDL_SetTextInputArea) else {
             return false;
         };
+        let area = pixels_rect(area);
         // SAFETY: a window this crate created and a live rectangle for the call.
-        unsafe { f(window, &area, cursor) }
+        unsafe { f(window, &area, pixels(cursor)) }
     }
 
     /// The calling thread's GL context is kept; see [`keep_gl_context`].
@@ -3549,7 +3628,7 @@ pub mod video {
         let f = api()?.SDL_GetWindowSize?;
         let (mut w, mut h) = (0, 0);
         // SAFETY: a window and two writable ints.
-        unsafe { f(window, &mut w, &mut h) }.then_some((w, h))
+        unsafe { f(window, &mut w, &mut h) }.then_some((points(w), points(h)))
     }
 
     pub fn set_window_size(window: Window, width: i32, height: i32) -> bool {
@@ -3557,7 +3636,7 @@ pub mod video {
             return false;
         };
         // SAFETY: a window this crate created.
-        let done = unsafe { f(window, width, height) };
+        let done = unsafe { f(window, pixels(width), pixels(height)) };
         resample_presentation_window(window);
         done
     }
@@ -3573,7 +3652,7 @@ pub mod video {
         let f = api()?.SDL_GetWindowPosition?;
         let (mut x, mut y) = (0, 0);
         // SAFETY: a window and two writable ints.
-        unsafe { f(window, &mut x, &mut y) }.then_some((x, y))
+        unsafe { f(window, &mut x, &mut y) }.then_some((points(x), points(y)))
     }
 
     pub fn set_window_position(window: Window, x: i32, y: i32) -> bool {
@@ -3581,7 +3660,7 @@ pub mod video {
             return false;
         };
         // SAFETY: a window this crate created.
-        let done = unsafe { f(window, x, y) };
+        let done = unsafe { f(window, pixels(x), pixels(y)) };
         resample_presentation_window(window);
         done
     }
@@ -3641,7 +3720,7 @@ pub mod video {
             return false;
         };
         // SAFETY: a window this crate created.
-        unsafe { f(window, width, height) }
+        unsafe { f(window, pixels(width), pixels(height)) }
     }
 
     /// `SDL_ShowWindowSystemMenu`: the window manager's own menu for the
@@ -3689,6 +3768,21 @@ pub mod video {
         let Some(f) = api().and_then(|a| a.SDL_SetWindowHitTest) else {
             return false;
         };
+        let callback = match (callback, x11_scale() != 1.0) {
+            (Some(callback), true) => {
+                let mut tests = HIT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+                tests.retain(|(w, _)| *w != window as usize);
+                tests.push((window as usize, callback));
+                Some(hit_test_in_points as HitTest)
+            }
+            (callback, _) => {
+                HIT_TESTS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|(w, _)| *w != window as usize);
+                callback
+            }
+        };
         // SAFETY: a window this crate created and a callback that ignores its
         // data pointer.
         unsafe { f(window, callback, std::ptr::null_mut()) }
@@ -3727,7 +3821,7 @@ pub mod video {
             return 1.0;
         };
         // SAFETY: a window this crate created.
-        let density = unsafe { f(window) };
+        let density = unsafe { f(window) } * x11_scale();
         match density > 0.0 {
             true => density,
             false => 1.0,
@@ -4112,14 +4206,14 @@ pub mod video {
         let f = api()?.SDL_GetDisplayBounds?;
         let mut rect = Rect::default();
         // SAFETY: a display id and a writable rect.
-        unsafe { f(display, &mut rect) }.then_some(rect)
+        unsafe { f(display, &mut rect) }.then(|| points_rect(rect))
     }
 
     pub fn display_usable_bounds(display: u32) -> Option<Rect> {
         let f = api()?.SDL_GetDisplayUsableBounds?;
         let mut rect = Rect::default();
         // SAFETY: a display id and a writable rect.
-        unsafe { f(display, &mut rect) }.then_some(rect)
+        unsafe { f(display, &mut rect) }.then(|| points_rect(rect))
     }
 
     /// As [`window_pixel_density`], for a display with no window on it.
@@ -4767,7 +4861,7 @@ pub mod video {
         // SAFETY: a display id.
         let mode = unsafe { f(display) };
         // SAFETY: SDL's own mode record, valid until the display changes.
-        (!mode.is_null()).then(|| unsafe { *mode })
+        (!mode.is_null()).then(|| points_mode(unsafe { *mode }))
     }
 
     /// The mode `display` is showing now, copied out of SDL's record: the
@@ -4777,7 +4871,7 @@ pub mod video {
         // SAFETY: a display id.
         let mode = unsafe { f(display) };
         // SAFETY: SDL's own mode record, valid until the display changes.
-        (!mode.is_null()).then(|| unsafe { *mode })
+        (!mode.is_null()).then(|| points_mode(unsafe { *mode }))
     }
 
     /// The display most of `window` is on, or `None` when SDL cannot say.
@@ -4819,7 +4913,7 @@ pub mod video {
         // SAFETY: `count` non-null mode pointers, as SDL just reported.
         let out = unsafe { std::slice::from_raw_parts(list, count.max(0) as usize) }
             .iter()
-            .map(|m| unsafe { **m })
+            .map(|m| points_mode(unsafe { **m }))
             .collect();
         // SAFETY: SDL allocated it, modes included, as one block.
         unsafe { free(list as *mut c_void) };
@@ -4966,7 +5060,7 @@ pub mod video {
         let (mut x, mut y) = (0.0, 0.0);
         // SAFETY: two writable floats.
         let buttons = unsafe { f(&mut x, &mut y) };
-        Some((x, y, buttons))
+        Some((x / x11_scale(), y / x11_scale(), buttons))
     }
 
     /// The window whose coordinate system `mouse_state` uses. Main thread only.
@@ -4983,7 +5077,7 @@ pub mod video {
         let (mut x, mut y) = (0.0, 0.0);
         // SAFETY: two writable floats.
         let buttons = unsafe { f(&mut x, &mut y) };
-        Some((x, y, buttons))
+        Some((x / x11_scale(), y / x11_scale(), buttons))
     }
 
     pub fn warp_mouse_global(x: f32, y: f32) -> bool {
@@ -4991,7 +5085,7 @@ pub mod video {
             return false;
         };
         // SAFETY: two coordinates.
-        unsafe { f(x, y) }
+        unsafe { f(x * x11_scale(), y * x11_scale()) }
     }
 
     /// Move the cursor to a window-relative point.
@@ -5005,7 +5099,7 @@ pub mod video {
         // Without `wp_pointer_warp_v1`, SDL warps through a committed lock.
         let _commits = crate::compositor::guard();
         // SAFETY: a window from SDL and two coordinates.
-        unsafe { f(window, x, y) };
+        unsafe { f(window, x * x11_scale(), y * x11_scale()) };
         true
     }
 
@@ -5181,6 +5275,7 @@ pub mod video {
         let Some(f) = api().and_then(|a| a.SDL_SetWindowMouseRect) else {
             return false;
         };
+        let rect = rect.map(pixels_rect);
         let ptr = rect.as_ref().map_or(std::ptr::null(), |r| r as *const Rect);
         // SAFETY: a window from SDL, and null or a rectangle SDL copies.
         unsafe { f(window, ptr) }
@@ -5192,7 +5287,7 @@ pub mod video {
         let f = api()?.SDL_GetWindowMouseRect?;
         // SAFETY: this is a valid SDL window, and the returned pointer, if
         // non-null, refers to SDL-owned memory valid through this call.
-        unsafe { f(window).as_ref().copied() }
+        unsafe { f(window).as_ref().copied() }.map(points_rect)
     }
 
     /// Whether `window` is holding the pointer, asked of SDL rather than
