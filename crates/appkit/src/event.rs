@@ -5,11 +5,13 @@ use sdl3::keycodes::{keymod, scancode};
 use crate::nsevent::{self, Fields, kind};
 use crate::window;
 
-/// Drain SDL's queue once, delivering what this tree can deliver.
+/// Drain SDL's queue once, delivering what this tree can deliver. True if at
+/// least one SDL event was waiting, which is the only sign of life the
+/// window system itself gives between polls - see `application::idle_slice`.
 ///
 /// `app` is the application, which is the object a window notification is posted
 /// about when the event names no window this crate made.
-pub fn pump(app: Id) {
+pub fn pump(app: Id) -> bool {
     let _ = app;
     // Before anything else: a thread waiting for a GL context this one holds is
     // a thread that is not drawing, and reaching here is what says this one has
@@ -20,7 +22,9 @@ pub fn pump(app: Id) {
     debug_key();
     crate::script::run();
     trace_views();
+    let mut delivered = false;
     while let Some(event) = sdl3::video::poll() {
+        delivered = true;
         deliver(event);
     }
     sdl3::pointer::service();
@@ -30,8 +34,12 @@ pub fn pump(app: Id) {
     for hook in hooks {
         hook();
     }
+    // A session `-beginDraggingSessionWithItems:` started runs here, in the
+    // event loop, after the call that started it has returned.
+    crate::dragging::run_pending();
     crate::application::check_last_window_closed();
     crate::backing::pump();
+    delivered
 }
 
 /// Service SDL surface work and publication on the video thread. Both the
@@ -462,6 +470,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             }
             let object = object_for(window);
             if !gained {
+                reset_pointer_motion();
                 crate::screen::forget_recentring();
                 crate::screen::release_relative_pointer(window);
             }
@@ -690,6 +699,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 // guest capture; otherwise later motion could leak past the edge.
                 if !down {
                     capture_mouse_button(id, button, false, false);
+                    crate::dragging::release_unreported(crate::button::number(button));
                 }
                 return;
             }
@@ -1537,6 +1547,9 @@ fn chain(start: Id, sel: objc::sel::Sel) -> Option<(Id, &'static objc::class::Me
 /// filled it in, so the last motion is what says which view the event is about.
 static POINTER: std::sync::Mutex<(f32, f32)> = std::sync::Mutex::new((0.0, 0.0));
 
+#[cfg(test)]
+pub(crate) static POINTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Record a programmatic cursor warp in window coordinates.
 ///
 /// SDL does not deliver a motion event for an in-window warp while relative
@@ -1545,6 +1558,16 @@ static POINTER: std::sync::Mutex<(f32, f32)> = std::sync::Mutex::new((0.0, 0.0))
 /// report the position from before the lock.
 pub(crate) fn warp_pointer(x: f32, y: f32) {
     *POINTER.lock().unwrap_or_else(|e| e.into_inner()) = (x, y);
+}
+
+/// Keep a programmatic warp and its coordinate system together, including
+/// when SDL has pumped a window change ahead of this event loop.
+pub(crate) fn warp_pointer_in_window(window: sdl3::Window, x: f32, y: f32) {
+    POINTER_WINDOW.store(
+        sdl3::video::window_id(window),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    warp_pointer(x, y);
 }
 
 /// Where a physical warp is expected to be echoed back as a motion event.
@@ -1594,6 +1617,14 @@ fn take_warp_delta() -> (f64, f64) {
     std::mem::take(&mut *WARP_DELTA.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// A warp or relative delta from before focus was lost must not be consumed
+/// by the first movement after focus returns. Preserve the frozen position.
+fn reset_pointer_motion() {
+    *WARP_ECHO.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    take_warp_delta();
+    crate::cgevent::reset_mouse_delta();
+}
+
 /// Within half a pixel: SDL converts between desktop and window coordinates.
 fn lands_on(target: (f32, f32), point: (f32, f32)) -> bool {
     (target.0 - point.0).abs() < 0.5 && (target.1 - point.1).abs() < 0.5
@@ -1639,9 +1670,14 @@ pub(crate) fn settle_pointer() {
     let Some((x, y, _)) = window::desktop_mouse_state() else {
         return;
     };
-    let origin = pointer_window()
-        .and_then(window::global_position)
-        .unwrap_or((0, 0));
+    let target = sdl3::video::mouse_focus().or_else(pointer_window);
+    if let Some(target) = target {
+        POINTER_WINDOW.store(
+            sdl3::video::window_id(target),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let origin = target.and_then(window::global_position).unwrap_or((0, 0));
     *POINTER.lock().unwrap_or_else(|e| e.into_inner()) = (x - origin.0 as f32, y - origin.1 as f32);
 }
 
@@ -2260,6 +2296,7 @@ mod tests {
 
     #[test]
     fn a_programmatic_warp_updates_the_reported_pointer() {
+        let _guard = POINTER_TEST_LOCK.lock().unwrap();
         let previous = pointer_position();
         warp_pointer(320.0, 240.0);
         let warped = pointer_position();
@@ -2270,12 +2307,35 @@ mod tests {
 
     #[test]
     fn a_warp_echo_is_taken_once() {
+        let _guard = POINTER_TEST_LOCK.lock().unwrap();
         expect_warp_echo((400.0, 300.0), (400.0, 300.0));
         assert!(!take_warp_echo(400.0, 300.0));
         expect_warp_echo((0.0, 0.0), (400.0, 300.0));
         assert!(!take_warp_echo(405.0, 300.0));
         assert!(take_warp_echo(400.2, 299.9));
         assert!(!take_warp_echo(400.0, 300.0));
+    }
+
+    #[test]
+    fn focus_loss_discards_old_motion_without_moving_the_frozen_cursor() {
+        let _guard = POINTER_TEST_LOCK.lock().unwrap();
+        let previous = pointer_position();
+        warp_pointer(320.0, 240.0);
+        expect_warp_echo((10.0, 10.0), (320.0, 240.0));
+        note_warp_delta(310.0, 230.0);
+        crate::cgevent::note_mouse_delta(12.0, -4.0);
+        crate::bootstrap();
+        deliver_past_modal(sdl3::video::Event::WindowFocus {
+            window: 0,
+            gained: false,
+        });
+        assert_eq!(pointer_position(), (320.0, 240.0));
+        assert!(!take_warp_echo(320.0, 240.0));
+        assert_eq!(take_warp_delta(), (0.0, 0.0));
+        let (mut dx, mut dy) = (99, 99);
+        unsafe { crate::cgevent::CGGetLastMouseDelta(&mut dx, &mut dy) };
+        assert_eq!((dx, dy), (0, 0));
+        warp_pointer(previous.0, previous.1);
     }
 
     #[test]
@@ -2287,6 +2347,7 @@ mod tests {
 
     #[test]
     fn warps_add_up_until_a_motion_event_takes_them() {
+        let _guard = POINTER_TEST_LOCK.lock().unwrap();
         take_warp_delta();
         note_warp_delta(120.0, -80.0);
         note_warp_delta(-20.0, 5.0);
