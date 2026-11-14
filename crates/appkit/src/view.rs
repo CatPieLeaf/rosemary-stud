@@ -2713,7 +2713,7 @@ fn intersection(a: NSRect, b: NSRect) -> NSRect {
 /// `-convertRectToBacking:`, which is the whole reason a Retina program asks a
 /// view anything.
 unsafe extern "C" fn convert_rect_to_backing(receiver: Id, _sel: Sel, rect: NSRect) -> NSRect {
-    let scale = scale(receiver);
+    let scale = scale(receiver) * crate::render_scale();
     NSRect {
         origin: NSPoint {
             x: rect.origin.x * scale,
@@ -2727,7 +2727,7 @@ unsafe extern "C" fn convert_rect_to_backing(receiver: Id, _sel: Sel, rect: NSRe
 }
 
 unsafe extern "C" fn convert_rect_from_backing(receiver: Id, _sel: Sel, rect: NSRect) -> NSRect {
-    let scale = scale(receiver);
+    let scale = scale(receiver) * crate::render_scale();
     NSRect {
         origin: NSPoint {
             x: rect.origin.x / scale,
@@ -2741,7 +2741,7 @@ unsafe extern "C" fn convert_rect_from_backing(receiver: Id, _sel: Sel, rect: NS
 }
 
 unsafe extern "C" fn convert_size_to_backing(receiver: Id, _sel: Sel, size: NSSize) -> NSSize {
-    let scale = scale(receiver);
+    let scale = scale(receiver) * crate::render_scale();
     NSSize {
         width: size.width * scale,
         height: size.height * scale,
@@ -3519,7 +3519,7 @@ unsafe extern "C" fn discard_cursor_rects(receiver: Id, _sel: Sel) {
 }
 
 unsafe extern "C" fn backing_scale_factor(receiver: Id, _sel: Sel) -> CGFloat {
-    scale(receiver)
+    scale(receiver) * crate::render_scale()
 }
 
 unsafe extern "C" fn appearance(receiver: Id, _sel: Sel) -> Id {

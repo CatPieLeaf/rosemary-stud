@@ -68,6 +68,22 @@ mod layout;
 mod matrix;
 pub mod menu;
 pub mod metadata;
+
+/// `ROSEMARY_RENDER_SCALE`, a fraction of one: the backing scale the guest is
+/// told, times this. A guest sizes what it draws from that factor, so it draws
+/// that much smaller, and presentation scales the drawable back up to the
+/// window. Only what the guest asks is scaled; this runtime's own geometry
+/// keeps the display's real density.
+pub(crate) fn render_scale() -> f64 {
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("ROSEMARY_RENDER_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|scale| *scale > 0.0 && *scale < 1.0)
+            .unwrap_or(1.0)
+    })
+}
 pub mod monitor;
 pub mod nib;
 pub mod nsevent;

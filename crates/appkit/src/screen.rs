@@ -158,7 +158,7 @@ unsafe extern "C" fn refresh_interval(receiver: Id, _sel: Sel) -> f64 {
 }
 
 unsafe extern "C" fn backing_scale_factor(receiver: Id, _sel: Sel) -> CGFloat {
-    sdl3::video::display_content_scale(display_of(receiver)) as f64
+    sdl3::video::display_content_scale(display_of(receiver)) as f64 * crate::render_scale()
 }
 
 /// `-deviceDescription`: `NSScreenNumber` for a `CGDirectDisplayID`, and

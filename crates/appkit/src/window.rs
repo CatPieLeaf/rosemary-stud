@@ -2942,7 +2942,7 @@ unsafe extern "C" fn backing_scale_factor(receiver: Id, _sel: Sel) -> CGFloat {
     let sdl = window_of(receiver).sdl;
     match sdl.is_null() {
         true => 1.0,
-        false => sdl3::video::window_pixel_density(sdl) as f64,
+        false => sdl3::video::window_pixel_density(sdl) as f64 * crate::render_scale(),
     }
 }
 

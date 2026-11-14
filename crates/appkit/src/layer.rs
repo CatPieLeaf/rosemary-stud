@@ -491,26 +491,8 @@ unsafe extern "C" fn pixel_format(receiver: Id, _sel: Sel) -> u64 {
     metal_layer_of(receiver).pixel_format
 }
 
-/// `ROSEMARY_RENDER_SCALE`, a fraction of one: the guest's drawables are made
-/// that much smaller, and presentation scales them back up to the window.
-fn render_scale() -> f64 {
-    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("ROSEMARY_RENDER_SCALE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|scale| *scale > 0.0 && *scale < 1.0)
-            .unwrap_or(1.0)
-    })
-}
-
 unsafe extern "C" fn set_drawable_size(receiver: Id, _sel: Sel, size: NSSize) {
-    let scale = render_scale();
-    let scaled = |v: f64| if v > 0.0 { (v * scale).round().max(1.0) } else { v };
-    metal_layer_of(receiver).drawable_size = NSSize {
-        width: scaled(size.width),
-        height: scaled(size.height),
-    };
+    metal_layer_of(receiver).drawable_size = size;
 }
 
 unsafe extern "C" fn drawable_size(receiver: Id, _sel: Sel) -> NSSize {

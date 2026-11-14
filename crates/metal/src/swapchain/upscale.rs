@@ -1,6 +1,7 @@
 //! A drawable smaller than the rectangle it is shown in, scaled up by a
-//! reconstruction filter instead of a linear blit: SGSR, or RAVU-Zoom with a
-//! sharpening pass after it. `ROSEMARY_UPSCALER` picks one (`sgsr`, `ravu`);
+//! reconstruction filter instead of a linear blit: SGSR1's edge-direction
+//! variant, or RAVU-Zoom r2 anti-ringing with RCAS after it. `ROSEMARY_UPSCALER`
+//! picks one (`sgsr-ed`, `ravu-ar`);
 //! unset, or built without glslc, the blit stays as it was.
 //!
 //! The frame is copied into an image of the upscaler's own before it is read,
@@ -30,8 +31,8 @@ fn kind() -> Option<Kind> {
             return None;
         }
         match std::env::var("ROSEMARY_UPSCALER").ok()?.as_str() {
-            "sgsr" => Some(Kind::Sgsr),
-            "ravu" => Some(Kind::Ravu),
+            "sgsr-ed" => Some(Kind::Sgsr),
+            "ravu-ar" => Some(Kind::Ravu),
             _ => None,
         }
     })
