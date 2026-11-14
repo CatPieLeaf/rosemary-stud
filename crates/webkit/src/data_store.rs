@@ -109,22 +109,36 @@ unsafe fn cookie_object(api: &gtk::Api, cookie: Ptr) -> Id {
             (api.soup_cookie_get_expires)(cookie),
         )
     };
+    let expires = (!expires.is_null())
+        // SAFETY: a `GDateTime` the cookie owns.
+        .then(|| unsafe { (api.g_date_time_to_unix)(expires) } as f64);
+    cookie_from_parts(&name, &value, &domain, &path, secure, expires)
+}
+
+/// An `NSHTTPCookie` with these properties; `expires` in seconds since 1970,
+/// `None` for a session cookie.
+fn cookie_from_parts(
+    name: &str,
+    value: &str,
+    domain: &str,
+    path: &str,
+    secure: bool,
+    expires: Option<f64>,
+) -> Id {
     let mut pairs: Vec<(Id, Id)> = [
-        ("NSHTTPCookieName", name.as_str()),
-        ("NSHTTPCookieValue", value.as_str()),
-        ("NSHTTPCookieDomain", domain.as_str()),
-        ("NSHTTPCookiePath", path.as_str()),
+        ("NSHTTPCookieName", name),
+        ("NSHTTPCookieValue", value),
+        ("NSHTTPCookieDomain", domain),
+        ("NSHTTPCookiePath", path),
     ]
     .into_iter()
     .chain(secure.then_some(("NSHTTPCookieSecure", "TRUE")))
     .map(|(key, value)| (engine::string(key), engine::string(value)))
     .collect();
-    if !expires.is_null() {
-        // SAFETY: a `GDateTime` the cookie owns.
-        let seconds = unsafe { (api.g_date_time_to_unix)(expires) };
+    if let Some(seconds) = expires {
         pairs.push((
             engine::string("NSHTTPCookieExpires"),
-            foundation::timer::date_since_1970(seconds as f64),
+            foundation::timer::date_since_1970(seconds),
         ));
     }
     let pairs: Vec<(CFTypeRef, CFTypeRef)> = pairs
@@ -168,15 +182,7 @@ unsafe fn soup_cookie(api: &gtk::Api, cookie: Id) -> Ptr {
             send!(cookie, "expiresDate"; Id),
         )
     };
-    let is_address = domain.parse::<std::net::IpAddr>().is_ok();
-    let domain = match domain.starts_with('.') || is_address || domain.is_empty() {
-        true => domain,
-        false => format!(".{domain}"),
-    };
-    let path = match path.is_empty() {
-        true => "/".to_string(),
-        false => path,
-    };
+    let (domain, path) = (cookie_domain(domain), cookie_path(path));
     let (name, value, domain, path) = (
         gtk::c_string(&name),
         gtk::c_string(&value),
@@ -207,6 +213,86 @@ unsafe fn soup_cookie(api: &gtk::Api, cookie: Id) -> Ptr {
         }
     }
     soup
+}
+
+/// A cookie's domain as a cookie jar takes it: Foundation keeps a domain
+/// cookie's domain without its leading dot, which to a jar is a host-only
+/// cookie, so the dot is put back.
+fn cookie_domain(domain: String) -> String {
+    let is_address = domain.parse::<std::net::IpAddr>().is_ok();
+    match domain.starts_with('.') || is_address || domain.is_empty() {
+        true => domain,
+        false => format!(".{domain}"),
+    }
+}
+
+fn cookie_path(path: String) -> String {
+    match path.is_empty() {
+        true => "/".to_string(),
+        false => path,
+    }
+}
+
+thread_local! {
+    /// The web view host's cookie calls still to be answered.
+    static CALLS: std::cell::RefCell<Vec<(usize, Block)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_call(call: usize) -> Option<Block> {
+    CALLS.with(|calls| {
+        let mut calls = calls.borrow_mut();
+        let at = calls.iter().position(|(c, _)| *c == call)?;
+        Some(calls.remove(at).1)
+    })
+}
+
+/// The web view host's answer to a cookie call.
+pub(crate) fn remote_event(message: &[String]) {
+    let call = crate::remote::number(message, 1) as usize;
+    let Some(completion) = take_call(call) else {
+        return;
+    };
+    if message[0] == "cookie_done" {
+        completion.call0();
+        return;
+    }
+    let list = crate::remote::json_object(crate::remote::field(message, 2));
+    let count = match list.is_null() || !engine::responds(list, "count") {
+        true => 0,
+        // SAFETY: an array; `-count` is `NSUInteger (id, SEL)`.
+        false => unsafe { send!(list, "count"; usize) },
+    };
+    let mut objects = Vec::new();
+    for index in 0..count {
+        // SAFETY: an index inside the array.
+        let entry = unsafe { send!(list, "objectAtIndex:", index => usize; Id) };
+        let text = |key: &str| engine::text_of(crate::remote::value_for(entry, key));
+        let expires = crate::remote::value_for(entry, "expires");
+        let expires = (!expires.is_null())
+            // SAFETY: a number; `-doubleValue` is `double (id, SEL)`.
+            .then(|| unsafe { send!(expires, "doubleValue"; f64) });
+        let object = cookie_from_parts(
+            &text("name"),
+            &text("value"),
+            &text("domain"),
+            &text("path"),
+            crate::bool_value(crate::remote::value_for(entry, "secure")),
+            expires,
+        );
+        if !object.is_null() {
+            objects.push(object as CFTypeRef);
+        }
+    }
+    if engine::tracing() {
+        eprintln!("rosemary: webkit: getAllCookies: {} cookie(s)", objects.len());
+    }
+    let array = corefoundation::collections::new_array(
+        &objects,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    completion.call1(objc::arc::autorelease(array as Id));
 }
 
 unsafe extern "C" fn all_cookies_ready(source: Ptr, result: Ptr, data: Ptr) {
@@ -259,6 +345,12 @@ unsafe extern "C" fn get_all_cookies(_receiver: Id, _sel: Sel, completion: Id) {
     let Some(completion) = Block::copy(completion) else {
         return;
     };
+    if let Some(remote) = crate::remote::get() {
+        let call = crate::remote::next_call();
+        CALLS.with(|calls| calls.borrow_mut().push((call, completion)));
+        remote.send(&["cookies_get", &call.to_string()]);
+        return;
+    }
     let Some(engine) = engine::get() else {
         engine::defer(move || completion.call1(empty_array()));
         return;
@@ -310,6 +402,45 @@ unsafe extern "C" fn change_ready(source: Ptr, result: Ptr, data: Ptr) {
 
 fn change_cookie(cookie: Id, completion: Id, adding: bool) {
     let completion = Block::copy(completion);
+    if !cookie.is_null()
+        && let Some(remote) = crate::remote::get()
+    {
+        let call = crate::remote::next_call();
+        // SAFETY: an `NSHTTPCookie`; each accessor is its own prototype.
+        let (name, value, domain, path, secure, expires) = unsafe {
+            (
+                engine::text_of(send!(cookie, "name"; Id)),
+                engine::text_of(send!(cookie, "value"; Id)),
+                cookie_domain(engine::text_of(send!(cookie, "domain"; Id))),
+                cookie_path(engine::text_of(send!(cookie, "path"; Id))),
+                send!(cookie, "isSecure"; u8) != 0,
+                send!(cookie, "expiresDate"; Id),
+            )
+        };
+        let expires = match expires.is_null() {
+            true => String::new(),
+            // SAFETY: a date; `-timeIntervalSince1970` is `double (id, SEL)`.
+            false => unsafe { send!(expires, "timeIntervalSince1970"; f64) }.to_string(),
+        };
+        if let Some(completion) = completion {
+            CALLS.with(|calls| calls.borrow_mut().push((call, completion)));
+        }
+        let call = call.to_string();
+        match adding {
+            true => remote.send(&[
+                "cookie_set",
+                &call,
+                &name,
+                &value,
+                &domain,
+                &path,
+                if secure { "1" } else { "0" },
+                &expires,
+            ]),
+            false => remote.send(&["cookie_delete", &call, &name, &domain, &path]),
+        }
+        return;
+    }
     let Some(engine) = engine::get().filter(|_| !cookie.is_null()) else {
         if let Some(completion) = completion {
             engine::defer(move || completion.call0());

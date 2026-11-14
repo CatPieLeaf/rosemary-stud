@@ -418,6 +418,37 @@ pub unsafe fn manager(object: Id, engine: &Engine) -> Ptr {
     controller.manager as Ptr
 }
 
+/// The scripts and the handler names a content controller holds, for the
+/// web view host.
+///
+/// # Safety
+///
+/// `object` must be null or an object this runtime allocated.
+pub unsafe fn content_of(object: Id) -> (Vec<Script>, Vec<String>) {
+    match unsafe { controller(object) } {
+        Some(c) => (
+            c.scripts.clone(),
+            c.handlers.iter().map(|(name, _)| name.clone()).collect(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    }
+}
+
+/// The content controller of `configuration` and its handler for `name`.
+///
+/// # Safety
+///
+/// `configuration` must be a configuration.
+pub unsafe fn handler_for(configuration: Id, name: &str) -> Option<(Id, Id)> {
+    let object = unsafe { controller_of(configuration) };
+    let found = unsafe { controller(object) }?;
+    found
+        .handlers
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, handler)| (object, *handler as Id))
+}
+
 /// The manager a configuration's views share, if one has been made.
 ///
 /// # Safety
@@ -465,6 +496,7 @@ unsafe extern "C" fn add_user_script(receiver: Id, _sel: Sel, user_script: Id) {
     {
         add_to_manager(engine, controller.manager as Ptr, user_script);
     }
+    crate::web_view::remote_content_changed(receiver);
 }
 
 unsafe extern "C" fn remove_all_user_scripts(receiver: Id, _sel: Sel) {
@@ -479,6 +511,7 @@ unsafe extern "C" fn remove_all_user_scripts(receiver: Id, _sel: Sel) {
         // The guest removed its own scripts, not the ones this port adds.
         rebuild_scripts(engine, controller);
     }
+    crate::web_view::remote_content_changed(receiver);
 }
 
 unsafe extern "C" fn user_scripts(receiver: Id, _sel: Sel) -> Id {
@@ -522,6 +555,7 @@ unsafe extern "C" fn add_script_message_handler(receiver: Id, _sel: Sel, handler
             }
         }
     }
+    crate::web_view::remote_content_changed(receiver);
 }
 
 unsafe extern "C" fn remove_script_message_handler(receiver: Id, _sel: Sel, name: Id) {
@@ -540,6 +574,7 @@ unsafe extern "C" fn remove_script_message_handler(receiver: Id, _sel: Sel, name
     {
         unregister_handler(engine, controller.manager as Ptr, &name);
     }
+    crate::web_view::remote_content_changed(receiver);
 }
 
 unsafe extern "C" fn remove_all_script_message_handlers(receiver: Id, sel: Sel) {

@@ -12,7 +12,7 @@ use objc::sel::Sel;
 use crate::compositor::{Command, Event, Monitor};
 use crate::engine::{self, Block, Engine, HostBlock};
 use crate::gtk::{self, Ptr};
-use crate::{clipboard, configuration, keys, send};
+use crate::{clipboard, configuration, keys, remote, send};
 
 /// What WebKit on macOS sends; with Studio's application name appended, as
 /// `applicationNameForUserAgent` appends it. Sites choose their Mac layout, and
@@ -50,6 +50,26 @@ struct View {
     cursor: Option<&'static str>,
     /// `-customUserAgent`, which replaces the configuration's agent.
     custom_user_agent: Option<String>,
+    /// Whether the page is shown by the web view host rather than WebKitGTK.
+    remote: bool,
+    /// What the host last reported of the page, which the getters answer and
+    /// key-value observers are told about.
+    page: PageState,
+    /// The size the host's window was shown at, `None` while it is hidden.
+    shown: Option<(c_int, c_int)>,
+    /// The person closed the host's window; it stays closed until the view
+    /// is hidden and shown again.
+    dismissed: bool,
+}
+
+#[derive(Clone, Default, PartialEq)]
+struct PageState {
+    url: String,
+    title: String,
+    loading: bool,
+    progress: f64,
+    back: bool,
+    forward: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -887,6 +907,12 @@ unsafe extern "C" fn set_custom_user_agent(receiver: Id, _sel: Sel, agent: Id) {
     }) else {
         return;
     };
+    if let Some((remote, id)) = remote_of(receiver) {
+        // SAFETY: the view's configuration.
+        let agent = agent.unwrap_or_else(|| unsafe { user_agent(configuration) });
+        remote.send(&["agent", &id.to_string(), &agent]);
+        return;
+    }
     let Some((engine, gtk)) = gtk_of(receiver) else {
         return;
     };
@@ -1152,8 +1178,27 @@ unsafe extern "C" fn init_with_frame_configuration(
             modifier_flags: 0,
             cursor: None,
             custom_user_agent: None,
+            remote: remote::get().is_some(),
+            page: PageState::default(),
+            shown: None,
+            dismissed: false,
         })
     });
+    if let Some(remote) = remote::get() {
+        // SAFETY: the configuration made or retained above.
+        let developer =
+            unsafe { configuration::preferences(configuration::preferences_of(configuration)) }
+                .is_some_and(|p| p.developer_extras);
+        // SAFETY: as above.
+        let agent = unsafe { user_agent(configuration) };
+        remote.send(&[
+            "create",
+            &id.to_string(),
+            &agent,
+            if developer { "1" } else { "0" },
+        ]);
+        send_content(remote, id, configuration);
+    }
     receiver
 }
 
@@ -1202,6 +1247,11 @@ fn forget(object: Id) {
         return;
     };
     appkit::backing::remove_overlay(object);
+    if view.remote
+        && let Some(remote) = remote::get()
+    {
+        remote.send(&["destroy", &view.id.to_string()]);
+    }
     if view.gtk != 0
         && let Some(engine) = engine::get()
     {
@@ -1539,6 +1589,17 @@ unsafe extern "C" fn load_request(receiver: Id, _sel: Sel, request: Id) -> Id {
         return std::ptr::null_mut();
     };
     eprintln!("rosemary: webkit: loading {url}");
+    if let Some((remote, id)) = remote_of(receiver) {
+        let navigation = start_navigation(receiver);
+        remote.send(&[
+            "load",
+            &id.to_string(),
+            &host_url(&url),
+            &method,
+            &remote::headers_json(&headers),
+        ]);
+        return navigation;
+    }
     let Some((engine, gtk)) = gtk_of(receiver) else {
         return std::ptr::null_mut();
     };
@@ -1594,6 +1655,9 @@ fn file_within_access(file: &std::path::Path, root: &std::path::Path) -> bool {
 }
 
 unsafe extern "C" fn can_go_back(receiver: Id, _sel: Sel) -> u8 {
+    if let Some(page) = remote_page(receiver) {
+        return u8::from(page.back);
+    }
     // SAFETY: the view's widget.
     gtk_of(receiver)
         .is_some_and(|(engine, gtk)| unsafe { (engine.api.webkit_web_view_can_go_back)(gtk) != 0 })
@@ -1601,6 +1665,9 @@ unsafe extern "C" fn can_go_back(receiver: Id, _sel: Sel) -> u8 {
 }
 
 unsafe extern "C" fn can_go_forward(receiver: Id, _sel: Sel) -> u8 {
+    if let Some(page) = remote_page(receiver) {
+        return u8::from(page.forward);
+    }
     // SAFETY: the view's widget.
     gtk_of(receiver).is_some_and(|(engine, gtk)| unsafe {
         (engine.api.webkit_web_view_can_go_forward)(gtk) != 0
@@ -1613,6 +1680,10 @@ unsafe extern "C" fn go_back(receiver: Id, sel: Sel) -> Id {
     if unsafe { can_go_back(receiver, sel) } == 0 {
         return std::ptr::null_mut();
     }
+    if let Some((remote, id)) = remote_of(receiver) {
+        remote.send(&["back", &id.to_string()]);
+        return start_navigation(receiver);
+    }
     let Some((engine, gtk)) = gtk_of(receiver) else {
         return std::ptr::null_mut();
     };
@@ -1624,6 +1695,10 @@ unsafe extern "C" fn go_forward(receiver: Id, sel: Sel) -> Id {
     // SAFETY: as `can_go_forward`.
     if unsafe { can_go_forward(receiver, sel) } == 0 {
         return std::ptr::null_mut();
+    }
+    if let Some((remote, id)) = remote_of(receiver) {
+        remote.send(&["forward", &id.to_string()]);
+        return start_navigation(receiver);
     }
     let Some((engine, gtk)) = gtk_of(receiver) else {
         return std::ptr::null_mut();
@@ -1656,6 +1731,10 @@ unsafe extern "C" fn go_forward_action(receiver: Id, sel: Sel, _sender: Id) {
 }
 
 unsafe extern "C" fn stop_loading(receiver: Id, _sel: Sel) {
+    if let Some((remote, id)) = remote_of(receiver) {
+        remote.send(&["stop", &id.to_string()]);
+        return;
+    }
     if let Some((engine, gtk)) = gtk_of(receiver) {
         // SAFETY: the view's widget.
         unsafe { (engine.api.webkit_web_view_stop_loading)(gtk) };
@@ -1663,6 +1742,12 @@ unsafe extern "C" fn stop_loading(receiver: Id, _sel: Sel) {
 }
 
 unsafe extern "C" fn url(receiver: Id, _sel: Sel) -> Id {
+    if let Some(page) = remote_page(receiver) {
+        return match page.url.is_empty() {
+            true => std::ptr::null_mut(),
+            false => objc::arc::autorelease(corefoundation::url::new(&page.url) as Id),
+        };
+    }
     let Some((engine, gtk)) = gtk_of(receiver) else {
         return std::ptr::null_mut();
     };
@@ -1743,6 +1828,19 @@ unsafe extern "C" fn javascript_ready(source: Ptr, result: Ptr, data: Ptr) {
 
 unsafe extern "C" fn evaluate_javascript(receiver: Id, _sel: Sel, script: Id, completion: Id) {
     let completion = Block::copy(completion);
+    if let Some((remote, id)) = remote_of(receiver) {
+        let call = remote::next_call();
+        if let Some(completion) = completion {
+            EVALUATIONS.with(|e| e.borrow_mut().push((call, completion)));
+        }
+        remote.send(&[
+            "eval",
+            &id.to_string(),
+            &call.to_string(),
+            &engine::text_of(script),
+        ]);
+        return;
+    }
     let Some((engine, gtk)) = gtk_of(receiver) else {
         if let Some(completion) = completion {
             engine::defer(move || {
@@ -2011,6 +2109,10 @@ unsafe extern "C" fn flags_changed(receiver: Id, _sel: Sel, event: Id) {
 }
 
 fn editing(receiver: Id, command: &std::ffi::CStr) {
+    if let Some((remote, id)) = remote_of(receiver) {
+        remote.send(&["edit", &id.to_string(), &command.to_string_lossy()]);
+        return;
+    }
     if let Some((engine, gtk)) = gtk_of(receiver) {
         if engine::tracing() {
             eprintln!("rosemary: webkit: editing command {command:?}");
@@ -2047,6 +2149,645 @@ unsafe extern "C" fn redo(receiver: Id, _sel: Sel, _sender: Id) {
     editing(receiver, c"Redo");
 }
 
+// ---------------------------------------------------------------------------
+// Pages shown by the web view host; see `crate::remote`.
+
+thread_local! {
+    /// `-evaluateJavaScript:completionHandler:` calls the host has yet to answer.
+    static EVALUATIONS: RefCell<Vec<(usize, Block)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The host and the view's id, for a view the host shows.
+fn remote_of(object: Id) -> Option<(&'static remote::Remote, usize)> {
+    let id = with_object(object, |v| v.remote.then_some(v.id)).flatten()?;
+    Some((remote::get()?, id))
+}
+
+/// What the host last said of a view's page, for a view the host shows.
+fn remote_page(object: Id) -> Option<PageState> {
+    with_object(object, |v| v.remote.then(|| v.page.clone())).flatten()
+}
+
+/// Send the host a view's scripts and message handler names.
+fn send_content(remote: &remote::Remote, id: usize, configuration: Id) {
+    // SAFETY: a view's configuration.
+    let controller = unsafe { configuration::controller_of(configuration) };
+    // SAFETY: its content controller.
+    let (scripts, handlers) = unsafe { configuration::content_of(controller) };
+    let flag = |on: bool| if on { "1" } else { "0" }.to_string();
+    let mut fields = vec!["scripts".to_string(), id.to_string(), scripts.len().to_string()];
+    for script in scripts {
+        fields.push(script.source);
+        fields.push(flag(script.at_document_start));
+        fields.push(flag(script.main_frame_only));
+    }
+    remote.send(&fields.iter().map(String::as_str).collect::<Vec<_>>());
+    let mut fields = vec!["handlers".to_string(), id.to_string()];
+    fields.extend(handlers);
+    remote.send(&fields.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+/// A content controller's scripts or handlers changed: every view the host
+/// shows with it gets them again.
+pub(crate) fn remote_content_changed(controller: Id) {
+    let Some(remote) = remote::get() else {
+        return;
+    };
+    let views: Vec<(usize, usize)> = VIEWS.with(|views| {
+        views
+            .borrow()
+            .iter()
+            .filter(|v| v.remote)
+            .map(|v| (v.id, v.configuration))
+            .collect()
+    });
+    for (id, configuration) in views {
+        // SAFETY: each view's retained configuration.
+        if unsafe { configuration::controller_of(configuration as Id) } == controller {
+            send_content(remote, id, configuration as Id);
+        }
+    }
+}
+
+/// Show each view's window while the view is shown, at the view's size, and
+/// hide it otherwise.
+pub(crate) fn remote_tick() {
+    let Some(remote) = remote::get() else {
+        return;
+    };
+    let views: Vec<(usize, usize)> = VIEWS.with(|views| {
+        views
+            .borrow()
+            .iter()
+            .filter(|v| v.remote)
+            .map(|v| (v.id, v.object))
+            .collect()
+    });
+    for (id, object) in views {
+        let object = object as Id;
+        let hidden = appkit::view::is_hidden_or_has_hidden_ancestor(object);
+        // SAFETY: a live view, registered while it is.
+        let window = unsafe { appkit::view::window_of(object) };
+        let shown = !hidden && !window.is_null() && appkit::window::is_shown(window);
+        // A view put in a window is sized by the layout after it, and the
+        // window is shown at the view's size: until the view has one, it
+        // waits.
+        let bounds = appkit::view::bounds_of(object);
+        let (width, height) = (
+            bounds.size.width.round() as c_int,
+            bounds.size.height.round() as c_int,
+        );
+        let size = (shown && width > 0 && height > 0).then_some((width, height));
+        let change = with_view(id, |v| {
+            if !shown {
+                v.dismissed = false;
+            }
+            let wanted = if v.dismissed { None } else { size };
+            // Shown at the view's size once: after that the window is the
+            // person's to size.
+            let changed = wanted.is_some() != v.shown.is_some();
+            if changed {
+                v.shown = wanted;
+            }
+            changed.then_some(wanted)
+        })
+        .flatten();
+        match change {
+            Some(Some((width, height))) => remote.send(&[
+                "show",
+                &id.to_string(),
+                &width.to_string(),
+                &height.to_string(),
+            ]),
+            Some(None) => remote.send(&["hide", &id.to_string()]),
+            None => {}
+        }
+    }
+}
+
+/// A navigation action for a page at `page` going to `url`.
+fn remote_action(url: &str, page: &str, kind: isize, main: bool, new_window: bool) -> Id {
+    let source_url = match page.is_empty() || page == "about:blank" {
+        true => url,
+        false => page,
+    };
+    let request = foundation::urlsession::request_for(url);
+    let mut objects = vec![request, frame_info(source_url, true)];
+    if !new_window {
+        objects.push(frame_info(url, main));
+    }
+    autoreleased(
+        action_class(),
+        NavigationAction {
+            navigation_type: kind,
+            objects: Owned::new(&objects),
+        },
+    )
+}
+
+struct RemoteDecision {
+    view: usize,
+    /// The host's number for a navigation it holds; `None` for a response,
+    /// which it does not hold, and which a cancel stops.
+    decision: Option<String>,
+    done: std::sync::atomic::AtomicBool,
+}
+
+/// `void (^)(WKNavigationActionPolicy)` and the response form: cancel is 0,
+/// allow is 1, and a download is not offered, so it cancels.
+unsafe extern "C" fn remote_decide(block: *mut HostBlock<RemoteDecision>, policy: isize) {
+    // SAFETY: the block `remote_policy` or `remote_response` made.
+    let context = unsafe { &(*block).context };
+    if context.done.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(remote) = remote::get() else {
+        return;
+    };
+    match &context.decision {
+        Some(decision) => remote.send(&["decide", decision, if policy == 1 { "1" } else { "0" }]),
+        None if policy != 1 => remote.send(&["stop", &context.view.to_string()]),
+        None => {}
+    }
+}
+
+fn remote_policy(remote: &remote::Remote, view: &Delegates, id: usize, message: &[String]) {
+    const SELECTOR: &str = "webView:decidePolicyForNavigationAction:decisionHandler:";
+    let decision = remote::field(message, 2).to_string();
+    let url = guest_url(remote::field(message, 3));
+    if engine::tracing() {
+        eprintln!("rosemary: webkit: navigation to {url}");
+    }
+    if !engine::responds(view.navigation, SELECTOR) {
+        remote.send(&["decide", &decision, "1"]);
+        return;
+    }
+    let page = with_view(id, |v| v.page.url.clone()).unwrap_or_default();
+    let action = remote_action(
+        &url,
+        &page,
+        remote::number(message, 4) as isize,
+        remote::number(message, 5) != 0,
+        remote::number(message, 6) != 0,
+    );
+    let handler = engine::host_block(
+        remote_decide as *const std::ffi::c_void,
+        RemoteDecision {
+            view: id,
+            decision: Some(decision),
+            done: std::sync::atomic::AtomicBool::new(false),
+        },
+    );
+    // SAFETY: the delegate answers the selector, whose prototype this is.
+    unsafe {
+        send!(view.navigation, "webView:decidePolicyForNavigationAction:decisionHandler:",
+            view.object => Id, action => Id, handler => Id; ())
+    };
+}
+
+fn remote_response(view: &Delegates, id: usize, message: &[String]) {
+    const SELECTOR: &str = "webView:decidePolicyForNavigationResponse:decisionHandler:";
+    if !engine::responds(view.navigation, SELECTOR) {
+        return;
+    }
+    let url = guest_url(remote::field(message, 2));
+    let status = remote::number(message, 3) as u16;
+    let response = foundation::urlsession::http_response(&url, status, Vec::new());
+    let object = autoreleased(
+        response_class(),
+        NavigationResponse {
+            main: remote::number(message, 4) != 0,
+            objects: Owned::new(&[response]),
+        },
+    );
+    let handler = engine::host_block(
+        remote_decide as *const std::ffi::c_void,
+        RemoteDecision {
+            view: id,
+            decision: None,
+            done: std::sync::atomic::AtomicBool::new(false),
+        },
+    );
+    // SAFETY: the delegate answers the selector.
+    unsafe {
+        send!(view.navigation, "webView:decidePolicyForNavigationResponse:decisionHandler:",
+            view.object => Id, object => Id, handler => Id; ())
+    };
+}
+
+fn remote_failed(view: &Delegates, id: usize, message: &[String]) {
+    let provisional = remote::number(message, 2) != 0;
+    let url = remote::field(message, 3);
+    let (domain, code, text) = (
+        remote::field(message, 4),
+        remote::number(message, 5),
+        remote::field(message, 6),
+    );
+    eprintln!("rosemary: webkit: loading {url} failed: {text} ({domain} {code})");
+    let error = foundation::error::make(domain, code, text);
+    let selector = match provisional {
+        true => "webView:didFailProvisionalNavigation:withError:",
+        false => "webView:didFailNavigation:withError:",
+    };
+    if engine::responds(view.navigation, selector) {
+        let navigation = with_view(id, |v| v.navigation).unwrap_or_default() as Id;
+        // SAFETY: the delegate answers the selector, `void (id, SEL, id, id, id)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id) =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                view.navigation,
+                objc::sel::get(selector),
+                view.object,
+                navigation,
+                error,
+            );
+        }
+    }
+    finish_navigation(id);
+}
+
+/// The page's state moved: observers of each key that changed hear of it, as
+/// WebKit's key-value observing tells them.
+fn remote_state(view: &Delegates, id: usize, message: &[String]) {
+    let state = PageState {
+        url: guest_url(remote::field(message, 2)),
+        title: remote::field(message, 3).to_string(),
+        loading: remote::number(message, 4) != 0,
+        progress: remote::field(message, 5).parse().unwrap_or(0.0),
+        back: remote::number(message, 6) != 0,
+        forward: remote::number(message, 7) != 0,
+    };
+    let Some(old) = with_view(id, |v| v.page.clone()) else {
+        return;
+    };
+    let mut keys = Vec::new();
+    if old.title != state.title {
+        keys.push("title");
+    }
+    if old.url != state.url {
+        keys.push("URL");
+    }
+    if old.loading != state.loading {
+        keys.push("loading");
+    }
+    if old.progress != state.progress {
+        keys.push("estimatedProgress");
+    }
+    if old.back != state.back {
+        keys.push("canGoBack");
+    }
+    if old.forward != state.forward {
+        keys.push("canGoForward");
+    }
+    for key in &keys {
+        // SAFETY: a live view; `-willChangeValueForKey:` is `void (id, SEL, id)`.
+        unsafe { send!(view.object, "willChangeValueForKey:", engine::string(key) => Id; ()) };
+    }
+    with_view(id, |v| v.page = state);
+    for key in keys.iter().rev() {
+        // SAFETY: as above.
+        unsafe { send!(view.object, "didChangeValueForKey:", engine::string(key) => Id; ()) };
+    }
+}
+
+fn ns_null() -> Id {
+    let class = objc::class::lookup(c"NSNull").expect("registered by Foundation");
+    // SAFETY: `+null` is `id (Class, SEL)`.
+    unsafe { send!(objc::class::ptr(class) as Id, "null"; Id) }
+}
+
+/// A page called `window.webkit.messageHandlers.NAME.postMessage(body)`.
+fn remote_message(view: &Delegates, message: &[String]) {
+    let name = remote::field(message, 2);
+    // SAFETY: the view's configuration.
+    let Some((controller, handler)) =
+        (unsafe { configuration::handler_for(view.configuration, name) })
+    else {
+        return;
+    };
+    // The host sends `{"v": body}`; a page that posts `null` or `undefined`
+    // gets `NSNull`, as WebKit gives.
+    let body = remote::value_for(remote::json_object(remote::field(message, 3)), "v");
+    let body = if body.is_null() { ns_null() } else { body };
+    let url = guest_url(remote::field(message, 4));
+    if engine::tracing() {
+        eprintln!("rosemary: webkit: script message to '{name}'");
+    }
+    let object = autoreleased(
+        message_class(),
+        ScriptMessage {
+            name: name.to_string(),
+            objects: Owned::new(&[body, view.object, frame_info(&url, true)]),
+        },
+    );
+    // SAFETY: a handler answers the `WKScriptMessageHandler` method.
+    unsafe {
+        send!(handler, "userContentController:didReceiveScriptMessage:",
+            controller => Id, object => Id; ())
+    };
+}
+
+/// The answer to `-evaluateJavaScript:completionHandler:`: the host sends
+/// `{"v": value}`, `{"u": true}` for undefined, `{"t": true}` for a value of a
+/// type WebKit does not bridge, or `{"e": message}` for an exception.
+pub(crate) fn remote_eval_result(message: &[String]) {
+    let call = remote::number(message, 1) as usize;
+    let completion = EVALUATIONS.with(|e| {
+        let mut e = e.borrow_mut();
+        let at = e.iter().position(|(c, _)| *c == call)?;
+        Some(e.remove(at).1)
+    });
+    let Some(completion) = completion else {
+        return;
+    };
+    let answer = remote::json_object(remote::field(message, 2));
+    let exception = remote::value_for(answer, "e");
+    if answer.is_null() {
+        // `WKErrorUnknown`.
+        let error = foundation::error::make("WKErrorDomain", 1, "no web content");
+        completion.call2(std::ptr::null_mut(), error);
+    } else if !exception.is_null() {
+        // `WKErrorJavaScriptExceptionOccurred`.
+        let error =
+            foundation::error::make("WKErrorDomain", 4, &engine::text_of(exception));
+        completion.call2(std::ptr::null_mut(), error);
+    } else if !remote::value_for(answer, "t").is_null() {
+        // `WKErrorJavaScriptResultTypeIsUnsupported`.
+        let error = foundation::error::make(
+            "WKErrorDomain",
+            5,
+            "JavaScript execution returned a result of an unsupported type",
+        );
+        completion.call2(std::ptr::null_mut(), error);
+    } else if !remote::value_for(answer, "u").is_null() {
+        completion.call2(std::ptr::null_mut(), std::ptr::null_mut());
+    } else {
+        completion.call2(remote::value_for(answer, "v"), std::ptr::null_mut());
+    }
+}
+
+struct DialogReply {
+    call: String,
+    done: std::sync::atomic::AtomicBool,
+}
+
+fn reply_dialog(context: &DialogReply, ok: bool, text: &str) {
+    if context.done.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(remote) = remote::get() {
+        remote.send(&["dialog_reply", &context.call, if ok { "1" } else { "0" }, text]);
+    }
+}
+
+/// `void (^)(void)`, for an alert.
+unsafe extern "C" fn dialog_done(block: *mut HostBlock<DialogReply>) {
+    // SAFETY: the block `remote_dialog` made.
+    reply_dialog(unsafe { &(*block).context }, true, "");
+}
+
+/// `void (^)(BOOL)`, for a confirmation.
+unsafe extern "C" fn dialog_confirmed(block: *mut HostBlock<DialogReply>, confirmed: u8) {
+    // SAFETY: as above.
+    reply_dialog(unsafe { &(*block).context }, confirmed != 0, "");
+}
+
+/// `void (^)(NSString *)`, for a prompt: nil is a cancel.
+unsafe extern "C" fn dialog_answered(block: *mut HostBlock<DialogReply>, text: Id) {
+    // SAFETY: as above.
+    let context = unsafe { &(*block).context };
+    reply_dialog(context, !text.is_null(), &engine::text_of(text));
+}
+
+/// A page's `alert`, `confirm` or `prompt`, which the UI delegate answers;
+/// without one, an alert is dismissed, a confirmation declined and a prompt
+/// cancelled, as WebKit does.
+fn remote_dialog(remote: &remote::Remote, view: &Delegates, message: &[String]) {
+    let call = remote::field(message, 2).to_string();
+    let kind = remote::field(message, 3);
+    let text = engine::string(remote::field(message, 4));
+    let default = engine::string(remote::field(message, 5));
+    let frame = frame_info(&guest_url(remote::field(message, 6)), true);
+    let context = || DialogReply {
+        call: call.clone(),
+        done: std::sync::atomic::AtomicBool::new(false),
+    };
+    const ALERT: &str = "webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:";
+    const CONFIRM: &str =
+        "webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:";
+    const PROMPT: &str = "webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:";
+    // SAFETY: each delegate method is sent only when the delegate answers it,
+    // with its own prototype.
+    unsafe {
+        match kind {
+            "alert" if engine::responds(view.ui, ALERT) => {
+                let handler = engine::host_block(dialog_done as *const std::ffi::c_void, context());
+                send!(view.ui, "webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:",
+                    view.object => Id, text => Id, frame => Id, handler => Id; ());
+            }
+            "confirm" if engine::responds(view.ui, CONFIRM) => {
+                let handler =
+                    engine::host_block(dialog_confirmed as *const std::ffi::c_void, context());
+                send!(view.ui, "webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:",
+                    view.object => Id, text => Id, frame => Id, handler => Id; ());
+            }
+            "prompt" if engine::responds(view.ui, PROMPT) => {
+                let handler =
+                    engine::host_block(dialog_answered as *const std::ffi::c_void, context());
+                send!(view.ui, "webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:",
+                    view.object => Id, text => Id, default => Id, frame => Id, handler => Id; ());
+            }
+            "alert" => remote.send(&["dialog_reply", &call, "1", ""]),
+            _ => remote.send(&["dialog_reply", &call, "0", ""]),
+        }
+    }
+}
+
+/// A page opened a window: the UI delegate is asked for a view, as WebKit asks
+/// it, and the view it answers loads what the page opened.
+fn remote_new_window(view: &Delegates, id: usize, message: &[String]) {
+    const SELECTOR: &str =
+        "webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:";
+    if !engine::responds(view.ui, SELECTOR) {
+        return;
+    }
+    let url = guest_url(remote::field(message, 2));
+    let page = with_view(id, |v| v.page.url.clone()).unwrap_or_default();
+    // `WKNavigationTypeOther`.
+    let action = remote_action(&url, &page, -1, true, true);
+    let features = objc::arc::autorelease(objc::object::create_instance(
+        objc::class::lookup(c"WKWindowFeatures").expect("registered during bootstrap"),
+        0,
+    ));
+    // SAFETY: the delegate answers the selector.
+    let created = unsafe {
+        send!(view.ui, "webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:",
+            view.object => Id, view.configuration => Id, action => Id, features => Id; Id)
+    };
+    if !created.is_null() && with_object(created, |_| ()).is_some() {
+        let request = foundation::urlsession::request_for(&url);
+        // SAFETY: a web view; `-loadRequest:` is `id (id, SEL, id)`.
+        unsafe { send!(created, "loadRequest:", request => Id; Id) };
+    }
+}
+
+/// Whether `object` is all its window holds: its content view, or the content
+/// view's one subview.
+fn fills_window(object: Id) -> bool {
+    // SAFETY: a live view; each accessor is AppKit's own prototype.
+    unsafe {
+        let window = send!(object, "window"; Id);
+        if window.is_null() {
+            return false;
+        }
+        let content = send!(window, "contentView"; Id);
+        if content == object {
+            return true;
+        }
+        let subviews = send!(content, "subviews"; Id);
+        send!(object, "superview"; Id) == content
+            && !subviews.is_null()
+            && send!(subviews, "count"; usize) == 1
+    }
+}
+
+/// The page's window closed: the person closed the host's window, or the page
+/// called `window.close()`. The UI delegate hears it as `webViewDidClose:`,
+/// as WebKit tells it when a page closes. Without one, a window that holds
+/// nothing but the page closes with it, and a page that is part of a larger
+/// window only goes away until it is shown again.
+fn remote_closed(view: &Delegates, id: usize) {
+    with_view(id, |v| {
+        v.dismissed = true;
+        v.shown = None;
+    });
+    if engine::responds(view.ui, "webViewDidClose:") {
+        // SAFETY: the delegate answers the selector, `void (id, SEL, id)`.
+        unsafe { send!(view.ui, "webViewDidClose:", view.object => Id; ()) };
+        return;
+    }
+    if fills_window(view.object) {
+        // SAFETY: a live view in a window; `-performClose:` is `void (id, SEL, id)`.
+        unsafe {
+            let window = send!(view.object, "window"; Id);
+            send!(window, "performClose:", std::ptr::null_mut::<std::ffi::c_void>() as Id => Id; ());
+        }
+    }
+}
+
+/// A message from the host about one of its views.
+pub(crate) fn remote_event(message: &[String]) {
+    let Some(remote) = remote::get() else {
+        return;
+    };
+    let id = remote::number(message, 1) as usize;
+    let Some(view) = delegates(id) else {
+        // The view is gone, but a page waiting on an answer still needs one.
+        match message[0].as_str() {
+            "policy" => remote.send(&["decide", remote::field(message, 2), "0"]),
+            "dialog" => remote.send(&["dialog_reply", remote::field(message, 2), "0", ""]),
+            _ => {}
+        }
+        return;
+    };
+    if engine::tracing() {
+        eprintln!("rosemary: webkit: host: {:?}", &message[..message.len().min(4)]);
+    }
+    match message[0].as_str() {
+        "policy" => remote_policy(remote, &view, id, message),
+        "response" => remote_response(&view, id, message),
+        "started" => notify(&view, id, "webView:didStartProvisionalNavigation:"),
+        "redirect" => notify(
+            &view,
+            id,
+            "webView:didReceiveServerRedirectForProvisionalNavigation:",
+        ),
+        "committed" => notify(&view, id, "webView:didCommitNavigation:"),
+        "finished" => {
+            notify(&view, id, "webView:didFinishNavigation:");
+            finish_navigation(id);
+        }
+        "failed" => remote_failed(&view, id, message),
+        "state" => remote_state(&view, id, message),
+        "message" => remote_message(&view, message),
+        "dialog" => remote_dialog(remote, &view, message),
+        "new_window" => remote_new_window(&view, id, message),
+        "closed" => remote_closed(&view, id),
+        "terminated" => {
+            eprintln!("rosemary: webkit: the web process terminated");
+            const SELECTOR: &str = "webViewWebContentProcessDidTerminate:";
+            if engine::responds(view.navigation, SELECTOR) {
+                // SAFETY: the delegate answers the selector.
+                unsafe {
+                    send!(view.navigation, "webViewWebContentProcessDidTerminate:", view.object => Id; ())
+                };
+            }
+        }
+        other => engine::warn_once(&format!("the web view host sent '{other}', which is unknown")),
+    }
+}
+
+/// `-title`.
+unsafe extern "C" fn title(receiver: Id, _sel: Sel) -> Id {
+    if let Some(page) = remote_page(receiver) {
+        return engine::string(&page.title);
+    }
+    let Some((engine, gtk)) = gtk_of(receiver) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: the view's widget; the string is the view's.
+    engine::string(&unsafe { gtk::text((engine.api.webkit_web_view_get_title)(gtk)) })
+}
+
+/// `-isLoading`.
+unsafe extern "C" fn is_loading(receiver: Id, _sel: Sel) -> u8 {
+    remote_page(receiver).is_some_and(|page| page.loading) as u8
+}
+
+/// `-estimatedProgress`.
+unsafe extern "C" fn estimated_progress(receiver: Id, _sel: Sel) -> f64 {
+    remote_page(receiver).map_or(0.0, |page| page.progress)
+}
+
+/// `-reload`, answering the navigation it starts.
+unsafe extern "C" fn reload(receiver: Id, _sel: Sel) -> Id {
+    if let Some((remote, id)) = remote_of(receiver) {
+        remote.send(&["reload", &id.to_string()]);
+        return start_navigation(receiver);
+    }
+    let Some((engine, gtk)) = gtk_of(receiver) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: the view's widget.
+    unsafe { (engine.api.webkit_web_view_reload)(gtk) };
+    start_navigation(receiver)
+}
+
+unsafe extern "C" fn reload_action(receiver: Id, sel: Sel, _sender: Id) {
+    unsafe { reload(receiver, sel) };
+}
+
+/// `-loadHTMLString:baseURL:`.
+unsafe extern "C" fn load_html_string(receiver: Id, _sel: Sel, html: Id, base: Id) -> Id {
+    let html = engine::text_of(html);
+    // SAFETY: a URL, or nil.
+    let base = unsafe { foundation::url::text_of(base) }.unwrap_or_default();
+    if let Some((remote, id)) = remote_of(receiver) {
+        let navigation = start_navigation(receiver);
+        remote.send(&["html", &id.to_string(), &html, &host_url(&base)]);
+        return navigation;
+    }
+    let Some((engine, gtk)) = gtk_of(receiver) else {
+        return std::ptr::null_mut();
+    };
+    let navigation = start_navigation(receiver);
+    let (html, base) = (gtk::c_string(&html), gtk::c_string(&host_url(&base)));
+    // SAFETY: the view's widget and two strings it copies.
+    unsafe { (engine.api.webkit_web_view_load_html)(gtk, html.as_ptr(), base.as_ptr()) };
+    navigation
+}
+
 pub fn install() {
     let view = objc::class::lookup(c"NSView").expect("AppKit registers NSView");
     // Registered as a view with no storage of its own: a guest subclass lays
@@ -2074,6 +2815,12 @@ pub fn install() {
         "goBack:" => go_back_action, c"v24@0:8@16";
         "goForward:" => go_forward_action, c"v24@0:8@16";
         "URL" => url, c"@16@0:8";
+        "title" => title, c"@16@0:8";
+        "isLoading" => is_loading, c"c16@0:8";
+        "estimatedProgress" => estimated_progress, c"d16@0:8";
+        "reload" => reload, c"@16@0:8";
+        "reload:" => reload_action, c"v24@0:8@16";
+        "loadHTMLString:baseURL:" => load_html_string, c"@32@0:8@16@24";
         "evaluateJavaScript:completionHandler:" => evaluate_javascript, c"v32@0:8@16@?24";
         "customUserAgent" => custom_user_agent, c"@16@0:8";
         "setCustomUserAgent:" => set_custom_user_agent, c"v24@0:8@16";

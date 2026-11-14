@@ -11,6 +11,7 @@ mod gtk;
 mod js;
 mod keys;
 mod legacy;
+mod remote;
 mod web_view;
 
 /// Send a message: `send!(receiver, "selector:", argument => Type, ...; Return)`.

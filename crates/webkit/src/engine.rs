@@ -23,6 +23,10 @@ static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 /// The engine, started on first use; `None` where WebKitGTK is missing or
 /// cannot open a display, or on a thread other than the one it runs on.
 pub fn get() -> Option<&'static Engine> {
+    // The web view host shows every page; WebKitGTK is not started beside it.
+    if crate::remote::requested() {
+        return None;
+    }
     let engine = ENGINE.get_or_init(|| {
         let started = start();
         if let Err(why) = &started {
@@ -181,6 +185,14 @@ thread_local! {
 /// expect.
 pub fn defer(work: impl FnOnce() + 'static) {
     DEFERRED.with(|deferred| deferred.borrow_mut().push(Box::new(work)));
+}
+
+/// Run the work `defer` queued, for a pump other than WebKitGTK's.
+pub fn run_deferred() {
+    let work = DEFERRED.with(|deferred| std::mem::take(&mut *deferred.borrow_mut()));
+    for item in work {
+        item();
+    }
 }
 
 fn pump() {
