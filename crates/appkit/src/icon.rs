@@ -13,7 +13,12 @@ static REPLACEMENT: Mutex<Option<Bitmap>> = Mutex::new(None);
 fn bundled() -> Option<&'static Bitmap> {
     static ICON: OnceLock<Option<Bitmap>> = OnceLock::new();
     ICON.get_or_init(|| {
-        let path = foundation::bundle::main()?.icon()?;
+        // `ROSEMARY_WINDOW_ICON`: an image file shown in place of the
+        // bundle's icon, for a launcher that presents the program as its own.
+        let path = match std::env::var_os("ROSEMARY_WINDOW_ICON") {
+            Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
+            _ => foundation::bundle::main()?.icon()?,
+        };
         let bytes = std::fs::read(&path).ok()?;
         let bitmap = crate::raster::decode(&bytes);
         if bitmap.is_none() {

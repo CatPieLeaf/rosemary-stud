@@ -549,10 +549,18 @@ fn say_no_tray() {
     });
 }
 
+/// `ROSEMARY_STATUS_ITEMS=0`: menu bar extras stay off the desktop's tray,
+/// for a launcher that keeps a tray icon of its own.
+fn status_items_shown() -> bool {
+    static SHOWN: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("ROSEMARY_STATUS_ITEMS").is_none_or(|v| v != "0"));
+    *SHOWN
+}
+
 /// Bring one item's tray up to date with the item.
 fn refresh(object: Id) {
     let item = item_of(object);
-    if item.visible == 0 {
+    if item.visible == 0 || !status_items_shown() {
         return;
     }
     let image = send_id(item.button, "image");

@@ -65,9 +65,29 @@ fn now() -> f64 {
 fn interval_of(link: &DisplayLink) -> f64 {
     let refresh = 1.0 / refresh_rate_of(link);
     let by_rate = (link.preferred_fps > 0).then(|| 1.0 / link.preferred_fps as f64);
-    by_rate
+    let interval = by_rate
         .map(|i| i.max(refresh))
-        .unwrap_or(refresh * link.frame_interval.max(1) as f64)
+        .unwrap_or(refresh * link.frame_interval.max(1) as f64);
+    match background_interval() {
+        Some(background) if !has_focus() => interval.max(background),
+        _ => interval,
+    }
+}
+
+/// `ROSEMARY_BACKGROUND_FPS`: the most calls a second a link makes while no
+/// window of the program has input focus. Unset or 0, it makes no difference.
+fn background_interval() -> Option<f64> {
+    static INTERVAL: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+        let fps: f64 = std::env::var("ROSEMARY_BACKGROUND_FPS").ok()?.trim().parse().ok()?;
+        (fps.is_finite() && fps > 0.0).then(|| 1.0 / fps)
+    });
+    *INTERVAL
+}
+
+fn has_focus() -> bool {
+    crate::window::sdl_windows()
+        .into_iter()
+        .any(|window| sdl3::video::window_flags(window) & sdl3::video::flags::INPUT_FOCUS != 0)
 }
 
 fn refresh_rate_of(link: &DisplayLink) -> f64 {

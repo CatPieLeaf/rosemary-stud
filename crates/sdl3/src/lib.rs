@@ -3228,10 +3228,22 @@ pub mod video {
         }
     }
 
+    /// `ROSEMARY_WINDOW_TITLE`: the title every window shows instead of the
+    /// one the program gives it, for a launcher that presents the program
+    /// under its own name.
+    fn title_override() -> Option<&'static CStr> {
+        static TITLE: LazyLock<Option<std::ffi::CString>> = LazyLock::new(|| {
+            let value = std::env::var("ROSEMARY_WINDOW_TITLE").ok()?;
+            std::ffi::CString::new(value).ok().filter(|title| !title.is_empty())
+        });
+        TITLE.as_deref()
+    }
+
     pub fn create_window(title: &CStr, width: i32, height: i32, flags: u64) -> Option<Window> {
         if !init_video() {
             return None;
         }
+        let title = title_override().unwrap_or(title);
         let create = api()?.SDL_CreateWindow?;
         // SAFETY: a NUL-terminated title and SDL's own flags.
         let window = unsafe { create(title.as_ptr(), width, height, flags) };
@@ -3438,6 +3450,7 @@ pub mod video {
         let Some(f) = api().and_then(|a| a.SDL_SetWindowTitle) else {
             return false;
         };
+        let title = title_override().unwrap_or(title);
         // SAFETY: a window and a NUL-terminated title.
         unsafe { f(window, title.as_ptr()) }
     }
