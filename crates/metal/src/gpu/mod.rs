@@ -589,6 +589,13 @@ impl Gpu {
         // per-feature list that would drift from the emitter.
         // SAFETY: the physical device belongs to this live instance.
         let features = unsafe { instance.get_physical_device_features(physical) };
+        // Except robust buffer access, which is not free: it bounds-checks
+        // every buffer access of every shader and every vertex fetch, and
+        // Metal promises nothing about an access out of bounds.
+        let features = vk::PhysicalDeviceFeatures {
+            robust_buffer_access: vk::FALSE,
+            ..features
+        };
 
         // SAFETY: the physical device belongs to this live instance.
         let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }
