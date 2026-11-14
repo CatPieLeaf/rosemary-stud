@@ -1323,6 +1323,179 @@ pub fn delegate_of(object: Id) -> Id {
     }
 }
 
+/// `ROSEMARY_WINDOW_STATE=FILE`: the first titled, resizable window opens at
+/// the size and in the state it was last left in, and every change to either
+/// is written back to `FILE` as it happens, so a session that is killed
+/// rather than quit still leaves it behind. One line: `normal`, `maximized`
+/// or `fullscreen`, then the content width and height the window had when it
+/// was last neither.
+mod remembered {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Mode {
+        Normal,
+        Maximized,
+        Fullscreen,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Saved {
+        pub mode: Mode,
+        pub width: i32,
+        pub height: i32,
+    }
+
+    /// The window being remembered, once one has been made.
+    pub(super) static WINDOW: AtomicUsize = AtomicUsize::new(0);
+    /// Whether its saved mode has been put back yet.
+    pub(super) static RESTORED: AtomicBool = AtomicBool::new(false);
+    static CURRENT: Mutex<Option<Saved>> = Mutex::new(None);
+
+    fn path() -> Option<&'static std::path::Path> {
+        static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+        PATH.get_or_init(|| std::env::var_os("ROSEMARY_WINDOW_STATE").map(Into::into))
+            .as_deref()
+    }
+
+    pub(super) fn parse(text: &str) -> Option<Saved> {
+        let mut words = text.split_whitespace();
+        let mode = match words.next()? {
+            "normal" => Mode::Normal,
+            "maximized" => Mode::Maximized,
+            "fullscreen" => Mode::Fullscreen,
+            _ => return None,
+        };
+        let width = words.next()?.parse().ok().filter(|w: &i32| *w > 0)?;
+        let height = words.next()?.parse().ok().filter(|h: &i32| *h > 0)?;
+        Some(Saved { mode, width, height })
+    }
+
+    /// What the file says, read once.
+    pub(super) fn saved() -> Option<Saved> {
+        let path = path()?;
+        let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+        if current.is_none() {
+            *current = std::fs::read_to_string(path).ok().as_deref().and_then(parse);
+        }
+        *current
+    }
+
+    /// Record `mode`, and the size with it only while the window is normal:
+    /// a maximized or fullscreen window goes back to the size it had before.
+    pub(super) fn record(mode: Mode, size: (i32, i32)) {
+        let Some(path) = path() else {
+            return;
+        };
+        let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+        let (width, height) = match (mode, *current) {
+            (Mode::Normal, _) | (_, None) => size,
+            (_, Some(previous)) => (previous.width, previous.height),
+        };
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let next = Saved { mode, width, height };
+        if current.is_some_and(|c| c.mode == next.mode && c.width == width && c.height == height) {
+            return;
+        }
+        *current = Some(next);
+        let word = match mode {
+            Mode::Normal => "normal",
+            Mode::Maximized => "maximized",
+            Mode::Fullscreen => "fullscreen",
+        };
+        let temporary = path.with_extension("new");
+        if std::fs::write(&temporary, format!("{word} {width} {height}\n")).is_ok() {
+            let _ = std::fs::rename(&temporary, path);
+        }
+    }
+
+    pub(super) fn is(receiver: objc::object::Id) -> bool {
+        !receiver.is_null() && WINDOW.load(Ordering::Acquire) == receiver as usize
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_saved_line_reads_back() {
+            let saved = parse("maximized 1600 900\n").unwrap();
+            assert_eq!((saved.mode, saved.width, saved.height), (Mode::Maximized, 1600, 900));
+            assert!(parse("tiny 0 0").is_none());
+            assert!(parse("normal -5 10").is_none());
+        }
+    }
+}
+
+/// The saved content size for the window being made, when it is the first
+/// one worth remembering.
+fn adopt_remembered(receiver: Id, style_mask: usize) -> Option<NSSize> {
+    let wanted = style::TITLED | style::RESIZABLE;
+    if style_mask & wanted != wanted {
+        return None;
+    }
+    remembered::WINDOW
+        .compare_exchange(0, receiver as usize, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+        .ok()?;
+    let saved = remembered::saved()?;
+    Some(NSSize {
+        width: f64::from(saved.width),
+        height: f64::from(saved.height),
+    })
+}
+
+/// Its saved state, once, as it is first shown.
+fn restore_remembered_mode(receiver: Id) {
+    if !remembered::is(receiver) || remembered::RESTORED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let Some(saved) = remembered::saved() else {
+        return;
+    };
+    let sdl = window_of(receiver).sdl;
+    match saved.mode {
+        remembered::Mode::Normal => {}
+        remembered::Mode::Maximized => {
+            sdl3::video::maximize_window(sdl);
+        }
+        // Through AppKit's own toggle, so the guest hears it entered.
+        remembered::Mode::Fullscreen => unsafe {
+            toggle_full_screen(receiver, objc::sel::get("toggleFullScreen:"), std::ptr::null_mut())
+        },
+    }
+}
+
+/// A resize or a change of state of the remembered window, written down.
+pub(crate) fn remember_state(receiver: Id) {
+    if !remembered::is(receiver) || !remembered::RESTORED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let window = window_of(receiver);
+    if window.sdl.is_null() {
+        return;
+    }
+    let flags = sdl3::video::window_flags(window.sdl);
+    if flags & (sdl3::video::flags::MINIMIZED | sdl3::video::flags::HIDDEN) != 0 {
+        return;
+    }
+    let mode = if flags & sdl3::video::flags::FULLSCREEN != 0 {
+        remembered::Mode::Fullscreen
+    } else if flags & sdl3::video::flags::MAXIMIZED != 0 {
+        remembered::Mode::Maximized
+    } else {
+        remembered::Mode::Normal
+    };
+    let Some((width, height)) = sdl3::video::window_size(window.sdl) else {
+        return;
+    };
+    // The SDL window is the whole frame; what is kept is the content, as the
+    // window is made from.
+    remembered::record(mode, (width, height - window.inset.round() as i32));
+}
+
 /// `ROSEMARY_WINDOW_SIZE=WIDTHxHEIGHT`, the size every window is created at.
 fn forced_size() -> Option<(i32, i32)> {
     static SIZE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
@@ -1343,6 +1516,10 @@ unsafe extern "C" fn init_with_content_rect(
 ) -> Id {
     let window = window_of(receiver);
     window.style_mask = style_mask;
+    let rect = match adopt_remembered(receiver, style_mask) {
+        Some(size) => NSRect { size, ..rect },
+        None => rect,
+    };
     // The content rectangle grows upwards by the chrome, as a Mac's frame
     // rectangle does: the SDL window is the whole frame.
     let inset = inset_of(receiver, style_mask, false);
@@ -2351,6 +2528,7 @@ fn order_front(receiver: Id, make_key: bool) {
         sdl3::video::set_window_position(sdl, local_x, local_y);
     }
     sdl3::video::show_window(sdl);
+    restore_remembered_mode(receiver);
     if want == Presentation::Toplevel {
         // A popup cannot be raised - it is already above its parent, and SDL
         // refuses - and asking would only log a failure.

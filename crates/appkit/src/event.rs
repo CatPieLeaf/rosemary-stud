@@ -387,6 +387,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 if let Some(name) = window::window_state_changed(object) {
                     post_for(object, name);
                 }
+                window::remember_state(object);
                 objc::arc::release(object);
             }
         }
@@ -428,6 +429,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             let content = window::content_view_of(object);
             if !object.is_null() {
                 window::size_settled(object);
+                window::remember_state(object);
                 // SAFETY: object resolves this SDL window's live NSWindow.
                 window::refresh_idle_opengl_clip(unsafe { window::sdl_window(object) });
                 window::fit_content_view(object);
