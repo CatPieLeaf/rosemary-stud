@@ -20,6 +20,8 @@ pub struct DisplayLink {
     range: FrameRateRange,
     paused: u8,
     invalidated: u8,
+    /// When this link last called back by its own schedule, in media time.
+    due: f64,
 }
 
 /// `CAFrameRateRange`: three `float`s, which AAPCS64 passes and returns in
@@ -141,7 +143,17 @@ unsafe extern "C" fn fire(_timer: *const c_void, info: *mut c_void) {
         if !link.timer.is_null() {
             // SAFETY: the `Arc` `schedule` leaked into the object, still held.
             let timer = unsafe { &*(link.timer as *const corefoundation::runloop::Timer) };
-            let wait = (next - when).max(0.0);
+            // A frame that overran its slot gets the next call as soon as the
+            // loop is free again, not at the refresh after it. Holding the call
+            // for the grid turns a frame a little over one refresh into two,
+            // halving the rate of a program whose frame costs a little more
+            // than the display's interval; the display itself waits on no one.
+            // A frame that fits still waits the interval out, so the rate the
+            // program asked for stays its cap. The stamps stay on the grid.
+            let scheduled = link.due + interval;
+            let call_at = if scheduled <= when { when } else { scheduled };
+            link.due = call_at;
+            let wait = call_at - when;
             if wait.is_finite() {
                 timer.set_next(at + std::time::Duration::from_secs_f64(wait));
             }
