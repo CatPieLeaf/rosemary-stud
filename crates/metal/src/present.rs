@@ -144,7 +144,30 @@ type DrawableCache = (std::sync::Mutex<Vec<Cached>>, std::sync::Condvar);
 static CACHE: DrawableCache = (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
 
 /// `-[CAMetalLayer nextDrawable]`.
+/// `ROSEMARY_BACKGROUND_FPS`, held where every frame passes whatever drives it
+/// - a display link, a timer or the program's own loop: while no window has
+/// focus, a drawable is handed out no sooner than the interval after the last.
+fn background_pace() {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Some(interval) = appkit::event::background_interval() else {
+        return;
+    };
+    let wait = {
+        let last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match (*last, appkit::event::has_focus()) {
+            (Some(at), false) => (at + std::time::Duration::from_secs_f64(interval))
+                .checked_duration_since(std::time::Instant::now()),
+            _ => None,
+        }
+    };
+    if let Some(wait) = wait {
+        std::thread::sleep(wait);
+    }
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+}
+
 pub(crate) unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
+    background_pace();
     let device = send_id(receiver, "device");
     let device = if device.is_null() {
         // SAFETY: called on the Metal framework's own thread.

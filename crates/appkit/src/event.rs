@@ -11,6 +11,31 @@ use crate::window;
 ///
 /// `app` is the application, which is the object a window notification is posted
 /// about when the event names no window this crate made.
+/// Whether a window of the program has input focus, as the last pump found:
+/// presentation asks from whichever thread draws, and SDL answers on this one.
+/// A program with no window yet counts as focused, so nothing is held back
+/// before it has one.
+static FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn has_focus() -> bool {
+    FOCUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `ROSEMARY_BACKGROUND_FPS` as the time between frames while no window has
+/// focus, or `None` where no limit is set.
+pub fn background_interval() -> Option<f64> {
+    crate::displaylink::background_interval()
+}
+
+fn note_focus() {
+    let windows = window::sdl_windows();
+    let focused = windows.is_empty()
+        || windows
+            .into_iter()
+            .any(|window| sdl3::video::window_flags(window) & sdl3::video::flags::INPUT_FOCUS != 0);
+    FOCUSED.store(focused, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn pump(app: Id) -> bool {
     let _ = app;
     // Before anything else: a thread waiting for a GL context this one holds is
@@ -27,6 +52,7 @@ pub fn pump(app: Id) -> bool {
         delivered = true;
         deliver(event);
     }
+    note_focus();
     sdl3::pointer::service();
     service_presentation();
     // General pump hooks may run guest code and are not modal-safe.
