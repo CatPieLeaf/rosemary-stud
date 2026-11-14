@@ -416,11 +416,36 @@ pub fn cpu_ticks() -> CpuTicks {
 
 /// Distinct sibling sets in sysfs: one per core, however many threads it runs.
 pub fn physical_cores() -> Option<u32> {
+    let allowed = allowed_cpus();
     let cores: std::collections::BTreeSet<String> = cpus()?
+        // Only the processors this process may run on: a program confined to
+        // some of the machine's cores has those cores, not all of them.
+        .filter(|cpu| {
+            let index = cpu
+                .file_name()
+                .and_then(|name| name.to_str()?.strip_prefix("cpu")?.parse::<usize>().ok());
+            match (&allowed, index) {
+                (Some(allowed), Some(index)) => allowed.contains(&index),
+                _ => true,
+            }
+        })
         .filter_map(|cpu| std::fs::read_to_string(cpu.join("topology/thread_siblings_list")).ok())
         .map(|siblings| siblings.trim().to_string())
         .collect();
     (!cores.is_empty()).then_some(cores.len() as u32)
+}
+
+/// The processors this process may run on, where the kernel says.
+fn allowed_cpus() -> Option<std::collections::BTreeSet<usize>> {
+    // SAFETY: a zeroed set the kernel fills for this process.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is a whole `cpu_set_t`, and its size is passed with it.
+    if unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) } != 0 {
+        return None;
+    }
+    let bits = 8 * size_of::<libc::cpu_set_t>();
+    // SAFETY: each index is inside the set's bits.
+    Some((0..bits).filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) }).collect())
 }
 
 /// Each `cpuN` directory in sysfs.

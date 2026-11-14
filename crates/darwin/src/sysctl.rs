@@ -257,6 +257,14 @@ const HW_LOGICALCPU_MAX: i32 = 117;
 const HW_PACKAGES: i32 = 118;
 const HW_CPUFREQUENCY: i32 = 119;
 const HW_ACTIVECPU: i32 = 120;
+const HW_NPERFLEVELS: i32 = 121;
+const HW_PERFLEVEL0: i32 = 122;
+/// The members of an `hw.perflevelN` node, in Darwin's order.
+const PERFLEVEL_PHYSICALCPU: i32 = 1;
+const PERFLEVEL_PHYSICALCPU_MAX: i32 = 2;
+const PERFLEVEL_LOGICALCPU: i32 = 3;
+const PERFLEVEL_LOGICALCPU_MAX: i32 = 4;
+const PERFLEVEL_NAME: i32 = 5;
 
 /// `machdep.cpu` and its leaves, likewise numbered here.
 const MACHDEP_CPU: i32 = 100;
@@ -414,6 +422,40 @@ const KEYS: &[Key] = &[
         name: "hw.logicalcpu_max",
         mib: &[CTL_HW, HW_LOGICALCPU_MAX],
         source: Source::Host(|| Some(Value::U32(configured_cpus()))),
+    },
+    // The performance levels a Mac with more than one kind of core reports,
+    // and which a program sizes its threads by. Every processor this process
+    // may run on is one level: a launcher that confines a program to the
+    // fastest cores has made those the cores it has.
+    Key {
+        name: "hw.nperflevels",
+        mib: &[CTL_HW, HW_NPERFLEVELS],
+        source: Source::Host(|| Some(Value::U32(1))),
+    },
+    Key {
+        name: "hw.perflevel0.physicalcpu",
+        mib: &[CTL_HW, HW_PERFLEVEL0, PERFLEVEL_PHYSICALCPU],
+        source: Source::Host(|| Some(Value::U32(physical_cpus()))),
+    },
+    Key {
+        name: "hw.perflevel0.physicalcpu_max",
+        mib: &[CTL_HW, HW_PERFLEVEL0, PERFLEVEL_PHYSICALCPU_MAX],
+        source: Source::Host(|| Some(Value::U32(physical_cpus()))),
+    },
+    Key {
+        name: "hw.perflevel0.logicalcpu",
+        mib: &[CTL_HW, HW_PERFLEVEL0, PERFLEVEL_LOGICALCPU],
+        source: Source::Host(|| Some(Value::U32(ncpu()))),
+    },
+    Key {
+        name: "hw.perflevel0.logicalcpu_max",
+        mib: &[CTL_HW, HW_PERFLEVEL0, PERFLEVEL_LOGICALCPU_MAX],
+        source: Source::Host(|| Some(Value::U32(ncpu()))),
+    },
+    Key {
+        name: "hw.perflevel0.name",
+        mib: &[CTL_HW, HW_PERFLEVEL0, PERFLEVEL_NAME],
+        source: Source::Host(|| Some(Value::Str("Performance".to_string()))),
     },
     Key {
         name: "hw.physicalcpu",
