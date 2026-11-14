@@ -1430,6 +1430,13 @@ mod remembered {
     }
 }
 
+/// Whether `sdl` is the main window's: the first titled, resizable window made,
+/// the one whose state is remembered.
+pub fn is_main_window(sdl: sdl3::Window) -> bool {
+    let window = remembered::WINDOW.load(std::sync::atomic::Ordering::Acquire) as Id;
+    !window.is_null() && !sdl.is_null() && window_of(window).sdl == sdl
+}
+
 /// The saved content size for the window being made, when it is the first
 /// one worth remembering.
 fn adopt_remembered(receiver: Id, style_mask: usize) -> Option<NSSize> {

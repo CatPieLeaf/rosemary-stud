@@ -1151,7 +1151,7 @@ pub(crate) fn enqueue_swapchain(drawable: Id) -> PresentAttempt {
             PresentAttempt::Readback
         };
     };
-    if forced_readback() {
+    if readback_for(frame.window) {
         return PresentAttempt::Readback;
     }
     // Where a web view sits over this layer, the window's store carries its
@@ -1386,6 +1386,17 @@ fn forced_readback() -> bool {
     #[static_init::dynamic]
     static FORCED: bool = std::env::var_os("ROSEMARY_PRESENT_READBACK").is_some();
     *FORCED
+}
+
+/// Whether `window` presents by readback: always under
+/// `ROSEMARY_PRESENT_READBACK`, and, under
+/// `ROSEMARY_SWAPCHAIN_MAIN_WINDOW_ONLY`, every window but the main one. A
+/// Vulkan layer that draws over each swapchain it sees (a performance
+/// overlay) then draws over the main window alone.
+fn readback_for(window: sdl3::Window) -> bool {
+    #[static_init::dynamic]
+    static MAIN_ONLY: bool = std::env::var_os("ROSEMARY_SWAPCHAIN_MAIN_WINDOW_ONLY").is_some();
+    forced_readback() || (*MAIN_ONLY && !appkit::window::is_main_window(window))
 }
 
 pub(crate) fn layer_frame(layer: Id) -> Option<appkit::view::Frame> {
@@ -2509,7 +2520,7 @@ pub(crate) fn present_store(
     overlays: &[appkit::backing::GpuOverlay],
 ) -> appkit::backing::PresentOutcome {
     use appkit::backing::PresentOutcome::{Deferred, Displayed, DisplayedEarlier, Fallback};
-    if forced_readback() {
+    if readback_for(window) {
         return store_failure_outcome(window);
     }
     if let Some(converted) = crate::swapchain::window_refused(window) {
@@ -2611,7 +2622,7 @@ pub(crate) fn present_store_synchronous(
     overlays: &[appkit::backing::GpuOverlay],
 ) -> appkit::backing::PresentOutcome {
     use appkit::backing::PresentOutcome::{Deferred, Displayed, Fallback};
-    if forced_readback() {
+    if readback_for(window) {
         return store_failure_outcome(window);
     }
     // Before GPU uploads or allocations, hand a contended window back to
