@@ -21,6 +21,9 @@ sdl3.workspace = true
 starnix.workspace = true
 static_init.workspace = true
 
+[build-dependencies]
+half.workspace = true
+
 [dev-dependencies]
 sdl3 = { workspace = true, features = ["test-support"] }
 iosurface.workspace = true

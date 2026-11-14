@@ -71,6 +71,18 @@ impl Drop for State {
 
 static STATE: OnceLock<Result<State, String>> = OnceLock::new();
 
+/// The opened device whose Vulkan handle this is.
+pub(crate) fn gpu_by_handle(device: vk::Device) -> Option<&'static Gpu> {
+    let Some(Ok(state)) = STATE.get() else {
+        return None;
+    };
+    state
+        .adapters
+        .iter()
+        .filter_map(Adapter::opened_gpu)
+        .find(|gpu| gpu.device.handle() == device)
+}
+
 /// Write out the pipeline cache of every device opened so far.
 pub(crate) fn save_pipeline_caches() {
     let Some(Ok(state)) = STATE.get() else {

@@ -1,6 +1,7 @@
 mod corners;
 mod present;
 mod scene;
+mod upscale;
 use scene::{SceneBlender, SceneLayer, ScenePlacement, ScenePrepared, SceneRollbackLayer};
 #[cfg(test)]
 mod tests;

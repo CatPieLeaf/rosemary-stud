@@ -240,6 +240,10 @@ pub(super) unsafe fn blit(
     target_layout: vk::ImageLayout,
     to: [vk::Offset3D; 2],
 ) {
+    // SAFETY: as this function's own contract.
+    if unsafe { super::upscale::blit(device, command_buffer, source, from, target, target_layout, to) } {
+        return;
+    }
     let region = vk::ImageBlit::default()
         .src_subresource(whole_color())
         .src_offsets(from)

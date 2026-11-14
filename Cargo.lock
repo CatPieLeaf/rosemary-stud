@@ -2055,6 +2055,7 @@ dependencies = [
  "darwin",
  "exports",
  "foundation",
+ "half",
  "iosurface",
  "libc",
  "metal_translate",
