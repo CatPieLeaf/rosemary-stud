@@ -22,7 +22,7 @@ use vertex::*;
 
 pub(crate) use buffer::leaking;
 
-pub(crate) use buffer::new_buffer;
+pub(crate) use buffer::{new_buffer, take_modified};
 pub(crate) use depth_stencil::{DepthStencilState, StencilState, new_depth_stencil_state};
 pub(crate) use heap::new_heap;
 #[cfg(test)]
@@ -44,6 +44,8 @@ pub(crate) struct Buffer {
     pub inner: GpuBuffer,
     pub options: u64,
     host: Option<gpu::HostPages>,
+    /// A managed buffer's copy in device memory; see [`Mirror`].
+    mirror: Option<Mirror>,
 }
 
 impl Default for SamplerDescriptor {
@@ -99,7 +101,7 @@ pub(crate) fn install() {
         "contents" => buffer_contents, c"^v16@0:8";
         "length" => buffer_length, c"Q16@0:8";
         "storageMode" => buffer_storage_mode, c"Q16@0:8";
-        "didModifyRange:" => crate::no_op, c"v32@0:8{_NSRange=QQ}16";
+        "didModifyRange:" => buffer_did_modify_range, c"v32@0:8{_NSRange=QQ}16";
         "addDebugMarker:range:" => crate::no_op, c"v40@0:8@16{_NSRange=QQ}24";
     });
 

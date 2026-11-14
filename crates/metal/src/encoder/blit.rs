@@ -65,6 +65,35 @@ fn linear_bytes(
     Some((row_texels, rows, total))
 }
 
+/// `-synchronizeResource:`: the CPU's copy of a managed buffer takes what the
+/// device wrote to its own. A texture has one copy only.
+pub(super) unsafe extern "C" fn synchronize_resource(receiver: Id, _sel: Sel, resource: Id) {
+    if resource.is_null() || !object::is_kind(resource, c"RosemaryMTLBuffer") {
+        return;
+    }
+    // SAFETY: an encoder of this crate's.
+    let encoder = unsafe { object::body::<Encoder>(receiver) };
+    let command = encoder.command();
+    // SAFETY: a buffer of this crate's, checked above.
+    let buffer = unsafe { object::body::<Buffer>(resource) };
+    let Some((device, length)) = buffer.device_copy() else {
+        return;
+    };
+    let (host, offset) = buffer.host_range(0, length);
+    let region = vk::BufferCopy::default()
+        .src_offset(0)
+        .dst_offset(offset)
+        .size(length);
+    // SAFETY: recording into this command buffer.
+    encoder.record_named("blit synchronizeResource", || unsafe {
+        command
+            .gpu
+            .device
+            .cmd_copy_buffer(command.command_buffer, device, host, &[region]);
+    });
+    command.retain(resource);
+}
+
 pub(super) unsafe extern "C" fn copy_buffer_to_buffer(
     receiver: Id,
     _sel: Sel,

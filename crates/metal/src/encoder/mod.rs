@@ -548,7 +548,9 @@ impl CommandBuffer {
     ) -> (vk::Buffer, u64) {
         // SAFETY: only buffers of this crate's reach a blit encoder.
         let body = unsafe { object::body::<Buffer>(source) };
-        let snapshot = body.host_pages().is_some_and(|pages| !pages.imported())
+        // A managed buffer is read from its device copy, as Metal does.
+        let snapshot = body.device_copy().is_none()
+            && body.host_pages().is_some_and(|pages| !pages.imported())
             && !self.waits_for_event()
             && self.gpu.event_waits_in_flight.load(Ordering::Acquire) == 0;
         if snapshot && let Some((buffer, at, target)) = self.reserve_snapshot(length) {
@@ -797,7 +799,7 @@ pub(crate) fn install() {
         "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:"
             => copy_texture_to_texture, c"v144@0:8@16Q24Q32{MTLOrigin=QQQ}40{MTLSize=QQQ}64@88Q96Q104{MTLOrigin=QQQ}112";
         "generateMipmapsForTexture:" => generate_mipmaps, c"v24@0:8@16";
-        "synchronizeResource:" => crate::no_op, c"v24@0:8@16";
+        "synchronizeResource:" => synchronize_resource, c"v24@0:8@16";
         "synchronizeTexture:slice:level:" => crate::no_op, c"v40@0:8@16Q24Q32";
         // Layout hints for a GPU's compressed texture storage; Vulkan picks
         // its own layouts, so there is nothing to change.

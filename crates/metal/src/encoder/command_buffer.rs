@@ -206,8 +206,35 @@ pub(super) unsafe extern "C" fn add_handler(receiver: Id, sel: Sel, block: Id) {
 /// queued since may hold this work until the CPU writes more, the device
 /// copies the bytes instead, in the command buffer this returns.
 fn resolve_snapshots(command: &mut CommandBuffer) -> Option<vk::CommandBuffer> {
+    // What the CPU wrote to managed buffers since the last commit, copied
+    // into upload memory now and carried to their device copies first.
+    let mut carried = Vec::new();
+    for object in crate::resource::take_modified(command.gpu) {
+        // SAFETY: the reference taken when the buffer was marked.
+        let body = unsafe { object::body::<Buffer>(object) };
+        if let Some((device, start, end)) = body.take_stale() {
+            let length = end - start;
+            match command.reserve_snapshot(length) {
+                Some((buffer, at, target)) => {
+                    // SAFETY: the stale range lies inside the buffer's
+                    // contents, and the reservation holds `length` bytes.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            body.inner.contents.add(start as usize),
+                            target,
+                            length as usize,
+                        )
+                    };
+                    carried.push((buffer, at, device, start, length));
+                }
+                None => gpu::trace("managed buffer upload memory failed"),
+            }
+        }
+        command.retain(object);
+        objc::arc::release(object);
+    }
     let snapshots = std::mem::take(&mut command.snapshots);
-    if snapshots.is_empty() {
+    if snapshots.is_empty() && carried.is_empty() {
         return None;
     }
     let gpu = command.gpu;
@@ -233,7 +260,7 @@ fn resolve_snapshots(command: &mut CommandBuffer) -> Option<vk::CommandBuffer> {
             )
         };
     }
-    if on_device.is_empty() {
+    if on_device.is_empty() && carried.is_empty() {
         return None;
     }
     let allocate = vk::CommandBufferAllocateInfo::default()
@@ -260,6 +287,33 @@ fn resolve_snapshots(command: &mut CommandBuffer) -> Option<vk::CommandBuffer> {
         ));
         unsafe { gpu.device.free_command_buffers(command.pool, &[prelude]) };
         return None;
+    }
+    if !carried.is_empty() {
+        // Earlier work may still read or write the device copies.
+        let before = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        // SAFETY: recording into the prelude.
+        unsafe {
+            gpu.device.cmd_pipeline_barrier(
+                prelude,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            )
+        };
+    }
+    for (from, at, to, start, length) in carried {
+        let region = vk::BufferCopy::default()
+            .src_offset(at)
+            .dst_offset(start)
+            .size(length);
+        // SAFETY: recording into the prelude; the command buffer holds the
+        // upload memory and the managed buffer until the work completes.
+        unsafe { gpu.device.cmd_copy_buffer(prelude, from, to, &[region]) };
     }
     for snapshot in on_device {
         // SAFETY: as above.
