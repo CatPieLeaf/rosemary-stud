@@ -2099,6 +2099,85 @@ fn send(receiver: Id, name: &str) {
 }
 
 /// Draw everything marked for display and present every window that changed.
+/// [`pump`], from the run loop's turn: at once when the turn delivered input
+/// or anything is waiting to be drawn, composed or presented, and otherwise at
+/// most once per refresh of the fastest display a window is on.
+///
+/// A turn is not a frame. Every source the main run loop handles - each block
+/// a game queues on the main queue - ends one, and a game queues several a
+/// frame; recomposing every window and re-laying its chrome on each of them
+/// was a measurable share of the main thread. Nothing here is skipped for
+/// good: whatever changed without asking to be drawn is found by the next
+/// pump, within one refresh, exactly as it would have been on the next turn.
+pub(crate) fn pump_if_due(delivered_input: bool) {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    // Pending work is asked only when the cheaper answers say no.
+    let due = pump_due(
+        delivered_input,
+        || pending_work(),
+        refresh_interval(),
+        last.map(|at| at.elapsed()),
+    );
+    if !due {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+    pump();
+}
+
+/// Whether a turn pumps: it delivered input, something is waiting, no display
+/// has been measured so there is no frame to keep to, or a refresh has passed
+/// since the last pump (`since`, `None` before the first).
+fn pump_due(
+    delivered_input: bool,
+    pending: impl FnOnce() -> bool,
+    interval: Option<std::time::Duration>,
+    since: Option<std::time::Duration>,
+) -> bool {
+    delivered_input
+        || match (interval, since) {
+            (None, _) | (_, None) => true,
+            (Some(interval), Some(since)) => since >= interval,
+        }
+        || pending()
+}
+
+/// One refresh of the fastest display any window is on, as SDL measured it.
+fn refresh_interval() -> Option<std::time::Duration> {
+    crate::window::sdl_windows()
+        .into_iter()
+        .filter_map(sdl3::video::cached_window_refresh_rate)
+        .max_by(f32::total_cmp)
+        .map(|rate| std::time::Duration::from_secs_f64(1.0 / f64::from(rate)))
+}
+
+/// Whether a pump now has something to do that is already known: a view to
+/// draw, damage to compose, a store to present - including one whose present
+/// was deferred - or a window the GPU path asked to have recomposed.
+fn pending_work() -> bool {
+    !NEEDS_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        || !NEEDS_DISPLAY_RECTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        || !GPU_ADMISSION_DAMAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        || WINDOWS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|windows| windows.values().any(|state| !state.damage.is_empty()))
+        || STORES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|stores| stores.values().any(|store| store.dirty))
+}
+
 pub fn pump() {
     for window in std::mem::take(
         &mut *GPU_ADMISSION_DAMAGE
@@ -4390,11 +4469,20 @@ fn blend_overlay_clipped(
 /// then went unwritten.
 static DUMPED: Mutex<Vec<(usize, std::time::Instant, bool)>> = Mutex::new(Vec::new());
 
+/// `ROSEMARY_STORE_OUT`, the directory stores are dumped to, read once: the
+/// pump asks every turn.
+fn store_out() -> Option<&'static std::ffi::OsString> {
+    static DIRECTORY: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| std::env::var_os("ROSEMARY_STORE_OUT"))
+        .as_ref()
+}
+
 /// Whether a store should be presented again only so that its last frame is
 /// written: without this, a window that stops changing within a second of
 /// its last dump leaves a stale picture of itself behind.
 fn dump_overdue(window: sdl3::Window) -> bool {
-    std::env::var_os("ROSEMARY_STORE_OUT").is_some()
+    store_out().is_some()
         && DUMPED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4406,7 +4494,7 @@ fn dump_overdue(window: sdl3::Window) -> bool {
 
 fn dump(window: sdl3::Window, store: &Store) {
     use std::time::Instant;
-    let Some(directory) = std::env::var_os("ROSEMARY_STORE_OUT") else {
+    let Some(directory) = store_out().cloned() else {
         return;
     };
     let mut last = DUMPED.lock().unwrap_or_else(|e| e.into_inner());
@@ -4804,6 +4892,24 @@ pub(crate) fn install() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_turn_pumps_on_input_on_pending_work_or_once_a_refresh() {
+        use std::time::Duration;
+        let refresh = Some(Duration::from_micros(6_944));
+        let soon = Some(Duration::from_millis(3));
+        let later = Some(Duration::from_millis(7));
+        // Within a refresh of the last pump, with nothing to do: skipped.
+        assert!(!super::pump_due(false, || false, refresh, soon));
+        // Input, or anything waiting to be drawn, is never held back.
+        assert!(super::pump_due(true, || false, refresh, soon));
+        assert!(super::pump_due(false, || true, refresh, soon));
+        // A refresh later, it pumps whatever the state.
+        assert!(super::pump_due(false, || false, refresh, later));
+        // With no display measured, or before the first pump, every turn does.
+        assert!(super::pump_due(false, || false, None, soon));
+        assert!(super::pump_due(false, || false, refresh, None));
+    }
+
     use super::*;
 
     #[test]

@@ -235,6 +235,21 @@ impl crate::memory::Regions for MmapSpace {
     }
 }
 
+/// The kernel's transparent huge page size, read once, or `None` where it has
+/// none.
+#[cfg(target_os = "linux")]
+fn huge_page_size() -> Option<Word> {
+    static SIZE: std::sync::OnceLock<Option<Word>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+            .filter(|size: &Word| size.is_power_of_two())
+    })
+}
+
 impl AddressSpace for MmapSpace {
     fn reserve(&mut self, size: usize, align: usize, placement: Placement) -> Result<Word> {
         if size == 0 {
@@ -348,6 +363,56 @@ impl AddressSpace for MmapSpace {
         Ok(len)
     }
 
+    fn advise_huge(&mut self, addr: Word, len: usize) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if self.jit {
+                return false;
+            }
+            let Some(huge) = huge_page_size() else {
+                return false;
+            };
+            // Only the whole huge pages inside the range can be huge.
+            let start = addr.next_multiple_of(huge);
+            let end = addr.saturating_add(len as Word) / huge * huge;
+            if end <= start {
+                return false;
+            }
+            let Ok(dst) = self.in_bounds(start, (end - start) as usize) else {
+                return false;
+            };
+            // SAFETY: advice over memory this space owns, which it reads not.
+            unsafe { libc::madvise(dst as *mut c_void, (end - start) as usize, libc::MADV_HUGEPAGE) == 0 }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (addr, len);
+            false
+        }
+    }
+
+    fn collapse_huge(&mut self, addr: Word, len: usize) {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            let Some(huge) = huge_page_size() else {
+                return;
+            };
+            let start = addr.next_multiple_of(huge);
+            let end = addr.saturating_add(len as Word) / huge * huge;
+            if end <= start {
+                return;
+            }
+            let Ok(dst) = self.in_bounds(start, (end - start) as usize) else {
+                return;
+            };
+            // SAFETY: memory this space owns and has written. A kernel that
+            // cannot collapse refuses, and the pages stay as they are.
+            unsafe { libc::madvise(dst as *mut c_void, (end - start) as usize, libc::MADV_COLLAPSE) };
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        let _ = (addr, len);
+    }
+
     fn read(&self, addr: Word, out: &mut [u8]) -> Result<()> {
         let src = self.in_bounds(addr, out.len())?;
         // SAFETY: `src` is within the owned mapping, which is readable.
@@ -455,6 +520,29 @@ mod tests {
         let mut out = [0xffu8; 16];
         mem.read(base, &mut out).unwrap();
         assert_eq!(out, [0u8; 16]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn whole_huge_pages_of_a_range_are_advised_and_a_smaller_range_is_not() {
+        let Some(huge) = huge_page_size() else {
+            return;
+        };
+        let mut mem = MmapSpace::new();
+        let base = mem.reserve(3 * huge as usize, 0x1000, Placement::Anywhere).unwrap();
+        // Less than one aligned huge page inside: nothing to advise.
+        assert!(!mem.advise_huge(base, (huge / 2) as usize));
+        // Three huge pages' worth holds at least two whole aligned ones.
+        assert!(mem.advise_huge(base, 3 * huge as usize));
+        let start = base.next_multiple_of(huge);
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let header = format!("{start:x}-");
+        let flags = smaps
+            .split('\n')
+            .skip_while(|line| !line.starts_with(&header))
+            .find(|line| line.starts_with("VmFlags:"))
+            .expect("the advised range has its own mapping");
+        assert!(flags.split_whitespace().any(|flag| flag == "hg"), "{flags}");
     }
 
     #[test]

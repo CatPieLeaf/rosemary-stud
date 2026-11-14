@@ -270,7 +270,12 @@ pub fn place(
         };
         match mapped {
             libc::MAP_FAILED => Err(KERN_NO_SPACE),
-            mapped => Ok(mapped as u64),
+            mapped => {
+                if matches!(backing, Backing::Private) {
+                    crate::vmmap::advise_huge(mapped, length as usize);
+                }
+                Ok(mapped as u64)
+            }
         }
     };
     if !anywhere {

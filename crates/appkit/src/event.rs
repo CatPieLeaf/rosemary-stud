@@ -64,7 +64,7 @@ pub fn pump(app: Id) -> bool {
     // event loop, after the call that started it has returned.
     crate::dragging::run_pending();
     crate::application::check_last_window_closed();
-    crate::backing::pump();
+    crate::backing::pump_if_due(delivered);
     delivered
 }
 

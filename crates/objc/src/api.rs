@@ -847,6 +847,7 @@ pub unsafe extern "C" fn object_copy(object: Id, extra: usize) -> Id {
                 class.instance_size() + extra - word,
             )
         };
+        crate::arc::reset_inline_count(copy);
     }
     copy
 }

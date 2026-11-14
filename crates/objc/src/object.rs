@@ -11,6 +11,32 @@ pub type Id = *mut c_void;
 /// size, and an instance of one would be a wrong program with no diagnostic.
 #[track_caller]
 pub fn create_instance(class: &'static Class, extra: usize) -> Id {
+    allocate_instance(class, extra, true)
+}
+
+/// [`create_instance`] for a host type that writes the whole of its instance
+/// before anything reads it: the bytes past the `isa` are left as the
+/// allocator gave them, but for the word [`Class::count_inline`] keeps the
+/// count in, which starts at zero.
+///
+/// For the host's own objects alone, made thousands of times a frame and
+/// several kilobytes each: zeroing them was work the body's write repeated.
+/// Never for anything a guest allocates, which `class_createInstance`
+/// promises zeroed.
+#[track_caller]
+pub fn create_instance_unzeroed(class: &'static Class) -> Id {
+    let object = allocate_instance(class, 0, false);
+    if !object.is_null()
+        && let Some(offset) = class.inline_count_offset()
+    {
+        // SAFETY: `count_inline`'s contract: the word lies inside the instance.
+        unsafe { *((object as *mut u8).add(offset) as *mut usize) = 0 };
+    }
+    object
+}
+
+#[track_caller]
+fn allocate_instance(class: &'static Class, extra: usize, zeroed: bool) -> Id {
     if !class.is_registered() {
         return std::ptr::null_mut();
     }
@@ -28,8 +54,10 @@ pub fn create_instance(class: &'static Class, extra: usize) -> Id {
     if memory.is_null() {
         return std::ptr::null_mut();
     }
-    // SAFETY: `size` bytes, freshly ours.
-    unsafe { std::ptr::write_bytes(memory as *mut u8, 0, size) };
+    if zeroed {
+        // SAFETY: `size` bytes, freshly ours.
+        unsafe { std::ptr::write_bytes(memory as *mut u8, 0, size) };
+    }
     // SAFETY: `memory` is at least one word and freshly ours.
     unsafe { *(memory as *mut *mut Class) = ptr(class) };
     // SAFETY: `memory` was allocated with `allocation_size`, including the
@@ -55,6 +83,12 @@ pub unsafe fn destruct_instance(object: Id) {
     let destruct = crate::sel::get(".cxx_destruct");
     // Apple's order: the ivars first, then the associations.
     let _associations = RemoveAssociations(object);
+    // The chain-wide lookup is cached; a class none of whose ancestors has
+    // ivars to destroy - every Metal object - is answered without asking each
+    // class of the chain for its own.
+    if class.method(destruct).is_none() {
+        return;
+    }
     for class in class.chain() {
         // Only a class's own: an inherited one runs once, for its own class.
         let Some(method) = class.own_method(destruct) else {
@@ -150,6 +184,10 @@ pub unsafe fn set_class(object: Id, class: &'static Class) -> Option<&'static Cl
     }
     let previous = unsafe { class_of(object) };
     crate::debug::set_class(object, class);
+    // A class counted inline and one counted in the table keep the count in
+    // different places, and the object's references must not be lost between
+    // them.
+    crate::arc::move_count(object, previous, class);
     // SAFETY: as above; the first word is the `isa`.
     unsafe { *(object as *mut *mut Class) = ptr(class) };
     previous

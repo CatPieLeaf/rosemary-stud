@@ -246,26 +246,25 @@ pub(super) unsafe extern "C" fn color_attachments(receiver: Id, _sel: Sel) -> Id
     if !descriptor.color_objects.is_null() {
         return descriptor.color_objects;
     }
-    let elements = (0..COLOR_ATTACHMENTS)
-        .map(|index| {
-            object::make(
-                c"RosemaryMTLColorAttachmentDescriptor",
-                ColorElement {
-                    owner: receiver,
-                    index,
-                    local: ColorAttachment::fresh(),
-                },
-            )
-        })
-        .collect::<Vec<_>>();
     let collection = object::make(
         c"RosemaryMTLIndexedCollection",
-        crate::resource::IndexedCollection {
-            elements,
+        crate::resource::IndexedCollection::new(
+            receiver,
+            COLOR_ATTACHMENTS,
+            |owner, index| {
+                object::make(
+                    c"RosemaryMTLColorAttachmentDescriptor",
+                    ColorElement {
+                        owner,
+                        index,
+                        local: ColorAttachment::fresh(),
+                    },
+                )
+            },
             // SAFETY: every element here is an `RosemaryMTLColorAttachmentDescriptor`.
-            orphan: |element| unsafe { crate::resource::orphan_element::<ColorElement>(element) },
-            assign: assign_color,
-        },
+            |element| unsafe { crate::resource::orphan_element::<ColorElement>(element) },
+            assign_color,
+        ),
     );
     unsafe { object::body::<RenderPipelineDescriptor>(receiver) }.color_objects = collection;
     collection
@@ -316,7 +315,9 @@ mod tests {
         // SAFETY: the registered methods of a descriptor this test made.
         unsafe {
             let colors = objc::arc::retain(color_attachments(descriptor, get));
-            let element = object::body::<crate::resource::IndexedCollection>(colors).elements[0];
+            let element = object::body::<crate::resource::IndexedCollection>(colors)
+                .element(0)
+                .expect("attachment 0");
             set_color_value(element, objc::sel::get("setPixelFormat:"), 80);
             descriptor_init(descriptor, objc::sel::get("reset"));
             assert_eq!(color_attachments(descriptor, get), colors);

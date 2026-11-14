@@ -129,6 +129,10 @@ struct ClassData {
     /// For a class whose `class_ro_t` names none, what the lazy class namer
     /// answered when first asked.
     lazy_name: OnceLock<CString>,
+    /// The byte offset of the word an instance keeps its extra references in,
+    /// or zero for a class whose instances are counted in [`crate::arc`]'s
+    /// table. See [`Class::count_inline`].
+    inline_count: AtomicUsize,
 }
 
 /// The header words of a compiled `objc_class` before [`adopt_pair`] took
@@ -320,6 +324,7 @@ impl Class {
             contents: RwLock::new(Contents::default()),
             compiled: None,
             lazy_name: OnceLock::new(),
+            inline_count: AtomicUsize::new(0),
         };
         match at {
             // SAFETY: the caller's obligation.
@@ -460,6 +465,34 @@ impl Class {
 
     pub fn instance_size(&self) -> usize {
         self.data().instance_size.load(Ordering::Acquire)
+    }
+
+    /// Count this class's instances in their own last word, as Apple counts in
+    /// the `isa`, rather than in [`crate::arc`]'s locked table.
+    ///
+    /// Only for a class the host declared with that word reserved at the end
+    /// of its instance size, before any instance exists, and whose instances
+    /// only [`crate::object::create_instance`] makes: never a static object in
+    /// an image, never memory a guest handed `objc_constructInstance`. The
+    /// word is this exact class's; a subclass is counted in the table.
+    pub fn count_inline(&self) {
+        let size = self.instance_size();
+        assert!(
+            self.is_registered() && size >= 2 * size_of::<usize>() && size % size_of::<usize>() == 0,
+            "{} cannot keep its count in its instances",
+            self.name_str()
+        );
+        self.data()
+            .inline_count
+            .store(size - size_of::<usize>(), Ordering::Release);
+    }
+
+    /// The offset [`Class::count_inline`] set, if it did.
+    pub fn inline_count_offset(&self) -> Option<usize> {
+        match self.data().inline_count.load(Ordering::Acquire) {
+            0 => None,
+            offset => Some(offset),
+        }
     }
 
     /// This class and every superclass, nearest first.

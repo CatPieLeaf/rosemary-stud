@@ -43,10 +43,16 @@ mod sends {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
 
-    /// log2 of the entry count.
-    pub(super) const BITS: u32 = 12;
-    /// The probe's `imul` takes a sign-extended 32-bit immediate.
-    pub(super) const MULTIPLIER: i32 = -1_640_531_535;
+    /// log2 of the entry count. A game sends to thousands of distinct
+    /// (class, selector) pairs a frame, and one entry per index means two hot
+    /// pairs on the same index evict each other on every send: at 4096 entries
+    /// the refills were a measurable share of a game's main thread. 32768
+    /// entries is one MiB of table.
+    pub(super) const BITS: u32 = 15;
+    /// Fibonacci hashing's 2^64 / phi, full width: the index is the product's
+    /// top bits, and a 32-bit multiplier leaves those blind to the key's low
+    /// 18 bits, where selectors of one image differ.
+    pub(super) const MULTIPLIER: i64 = 0x9E37_79B9_7F4A_7C15_u64 as i64;
 
     #[repr(C, align(32))]
     pub(super) struct Entry {
@@ -72,7 +78,7 @@ mod sends {
     /// its assembly.
     pub(super) fn index(class: usize, sel: usize) -> usize {
         let key = ((class as u64) << 7) ^ sel as u64;
-        (key.wrapping_mul(MULTIPLIER as i64 as u64) >> (64 - BITS)) as usize
+        (key.wrapping_mul(MULTIPLIER as u64) >> (64 - BITS)) as usize
     }
 
     /// The `IMP` cached for `(class, sel)`, read as the probe reads it.
@@ -461,7 +467,8 @@ unsafe extern "C" fn msg_send() {
         "mov     r11, rax",
         "shl     r11, 7",
         "xor     r11, rsi",
-        "imul    r11, r11, {multiplier}",
+        "mov     r10, {multiplier}",
+        "imul    r11, r10",
         "shr     r11, {shift}",
         "shl     r11, 5",
         "lea     r10, [rip + {table}]",
@@ -1066,18 +1073,37 @@ mod tests {
         unsafe { *(object as *const usize) }
     }
 
+    /// Selectors of one image sit within a few KiB of each other; sends to one
+    /// class with neighbouring selectors must not share entries.
+    #[test]
+    fn neighbouring_selectors_spread_over_the_table() {
+        let class = 0x6000_0123_4560_usize;
+        let base = 0x1_0040_0000_usize;
+        let mut seen: Vec<usize> = (0..64).map(|i| sends::index(class, base + i * 16)).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert!(seen.len() >= 60, "{} distinct entries of 64", seen.len());
+    }
+
     #[test]
     fn a_cached_send_follows_a_replaced_implementation() {
         let sel = crate::sel::get("rosemaryCachedAnswer");
         let class = class_answering(c"RosemaryCachedSendReplaced", sel, answer_one);
         let instance = crate::object::create_instance(class, 0);
-        assert_eq!(send_answer(instance, sel), 1);
-        assert_eq!(send_answer(instance, sel), 1);
-        if cfg!(target_arch = "x86_64") {
-            assert_eq!(
-                sends::cached(isa(instance), sel as usize),
-                Some(answer_one as *const () as usize)
-            );
+        // Another test registering a class meanwhile empties the cache, so it
+        // is asked only of sends no registration came between.
+        loop {
+            let generation = crate::class::generation();
+            assert_eq!(send_answer(instance, sel), 1);
+            assert_eq!(send_answer(instance, sel), 1);
+            let cached = sends::cached(isa(instance), sel as usize);
+            if crate::class::generation() != generation {
+                continue;
+            }
+            if cfg!(target_arch = "x86_64") {
+                assert_eq!(cached, Some(answer_one as *const () as usize));
+            }
+            break;
         }
         class.replace_method(sel, answer_two as crate::class::Imp, c"Q16@0:8");
         assert_eq!(send_answer(instance, sel), 2);

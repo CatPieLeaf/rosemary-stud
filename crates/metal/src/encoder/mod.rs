@@ -368,6 +368,118 @@ pub(crate) struct Encoder {
     dynamic_offsets: Vec<u32>,
     vertex_buffers: [(vk::Buffer, u64); SLOTS],
     index_buffer: (vk::Buffer, u64, vk::IndexType),
+    /// The descriptor infos a set write points into, kept between writes: a
+    /// draw whose bindings changed writes a set, and a game draws thousands
+    /// of times a frame.
+    descriptor_scratch: DescriptorScratch,
+}
+
+/// The growable buffers an encoder fills as it records, kept from one encoder
+/// to the next with their contents cleared: a frame makes dozens of encoders,
+/// and each one's first draws grew every buffer here from nothing again.
+#[derive(Default)]
+struct EncoderScratch {
+    wanted: [Vec<DescriptorEntry>; SETS],
+    cached_entries: [Vec<DescriptorEntry>; SETS],
+    dynamic_offsets: Vec<u32>,
+    bound_offsets: [Vec<u32>; 2],
+    descriptor_scratch: DescriptorScratch,
+    attachments: Vec<(vk::Image, vk::ImageAspectFlags)>,
+}
+
+/// Scratch left by encoders that have gone, for the next ones. It holds at
+/// most as many as were ever alive at once.
+static ENCODER_SCRATCH: Mutex<Vec<EncoderScratch>> = Mutex::new(Vec::new());
+
+impl EncoderScratch {
+    /// Scratch from an encoder that has gone, or new.
+    fn take() -> Self {
+        ENCODER_SCRATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// Empty every buffer, keeping its capacity, and keep the lot.
+    fn give_back(mut self) {
+        for entries in self.wanted.iter_mut().chain(self.cached_entries.iter_mut()) {
+            entries.clear();
+        }
+        self.dynamic_offsets.clear();
+        for offsets in &mut self.bound_offsets {
+            offsets.clear();
+        }
+        self.descriptor_scratch.clear();
+        self.attachments.clear();
+        ENCODER_SCRATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(self);
+    }
+}
+
+impl Encoder {
+    /// Start-of-encoder state for the buffers [`EncoderScratch`] carries: no
+    /// set cached or bound, nothing wanted, no attachments.
+    fn scratch_fields(
+        scratch: EncoderScratch,
+    ) -> (
+        [BindPoint; 2],
+        [SetCache; SETS],
+        [Vec<DescriptorEntry>; SETS],
+        Vec<u32>,
+        DescriptorScratch,
+        Vec<(vk::Image, vk::ImageAspectFlags)>,
+    ) {
+        let EncoderScratch {
+            wanted,
+            cached_entries,
+            dynamic_offsets,
+            bound_offsets,
+            descriptor_scratch,
+            attachments,
+        } = scratch;
+        let bound = bound_offsets.map(|offsets| BindPoint {
+            offsets,
+            ..BindPoint::default()
+        });
+        let set_cache = cached_entries.map(|entries| SetCache {
+            entries,
+            ..SetCache::default()
+        });
+        (bound, set_cache, wanted, dynamic_offsets, descriptor_scratch, attachments)
+    }
+
+    /// Hand this encoder's buffers to the next one, as it goes.
+    fn give_back_scratch(&mut self) {
+        use std::mem::take;
+        EncoderScratch {
+            wanted: self.wanted.each_mut().map(|wanted| take(wanted)),
+            cached_entries: self.set_cache.each_mut().map(|cache| take(&mut cache.entries)),
+            dynamic_offsets: take(&mut self.dynamic_offsets),
+            bound_offsets: self.bound.each_mut().map(|bound| take(&mut bound.offsets)),
+            descriptor_scratch: take(&mut self.descriptor_scratch),
+            attachments: take(&mut self.attachments),
+        }
+        .give_back();
+    }
+}
+
+/// See [`Encoder::descriptor_scratch`].
+#[derive(Default)]
+pub(crate) struct DescriptorScratch {
+    pub buffer_infos: Vec<vk::DescriptorBufferInfo>,
+    pub image_infos: Vec<vk::DescriptorImageInfo>,
+    pub texel_views: Vec<vk::BufferView>,
+}
+
+impl DescriptorScratch {
+    pub fn clear(&mut self) {
+        self.buffer_infos.clear();
+        self.image_infos.clear();
+        self.texel_views.clear();
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1005,6 +1117,39 @@ pub(crate) fn install() {
             implementation as *const std::ffi::c_void,
             c"v24@0:8Q16",
         );
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    #[test]
+    fn recycled_scratch_is_empty_and_caches_nothing() {
+        let mut scratch = EncoderScratch::default();
+        scratch.wanted[0].push(DescriptorEntry { binding: 0, kind: vk::DescriptorType::SAMPLER, handle: 0, offset: 0, range: 0, dynamic_offset: 0 });
+        scratch.cached_entries[1].push(DescriptorEntry { binding: 0, kind: vk::DescriptorType::SAMPLER, handle: 0, offset: 0, range: 0, dynamic_offset: 0 });
+        scratch.dynamic_offsets.push(64);
+        scratch.bound_offsets[0].push(128);
+        scratch.attachments.push((vk::Image::null(), vk::ImageAspectFlags::COLOR));
+        let capacity = scratch.wanted[0].capacity();
+        scratch.give_back();
+
+        // The pool may hold others too; every one must be empty.
+        let pooled: Vec<EncoderScratch> =
+            std::mem::take(&mut *ENCODER_SCRATCH.lock().unwrap());
+        assert!(pooled.iter().any(|s| s.wanted[0].capacity() >= capacity));
+        for scratch in pooled {
+            assert!(scratch.wanted.iter().all(Vec::is_empty));
+            assert!(scratch.cached_entries.iter().all(Vec::is_empty));
+            assert!(scratch.dynamic_offsets.is_empty());
+            assert!(scratch.bound_offsets.iter().all(Vec::is_empty));
+            assert!(scratch.attachments.is_empty());
+            let (bound, set_cache, ..) = Encoder::scratch_fields(scratch);
+            assert!(bound.iter().all(|b| b.pipeline == vk::Pipeline::null()
+                && b.sets.iter().all(|s| *s == vk::DescriptorSet::null())));
+            assert!(set_cache.iter().all(|c| c.set == vk::DescriptorSet::null()));
+        }
     }
 }
 

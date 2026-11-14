@@ -216,6 +216,36 @@ pub fn sync_flags(flags: i32) -> i32 {
     }
 }
 
+/// The kernel's transparent huge page size, read once, or `None` where it
+/// has none.
+pub fn huge_page_size() -> Option<usize> {
+    static SIZE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+            .filter(|size: &usize| size.is_power_of_two())
+    })
+}
+
+/// Back a fresh private anonymous guest mapping with huge pages where the
+/// kernel can: a game's heap is hundreds of megabytes of arenas, and with
+/// small pages its loads spent a measurable share of the main thread walking
+/// page tables. A mapping smaller than one huge page cannot hold one, and is
+/// left alone; the kernel splits a huge page again wherever the guest later
+/// gives part of it back.
+pub(crate) fn advise_huge(addr: *mut c_void, len: usize) {
+    #[cfg(target_os = "linux")]
+    if huge_page_size().is_some_and(|huge| len >= huge) {
+        // SAFETY: advice over a mapping the caller just made; it reads nothing.
+        unsafe { libc::madvise(addr, len, libc::MADV_HUGEPAGE) };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (addr, len);
+}
+
 /// `void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)`
 ///
 /// # Safety
@@ -232,7 +262,7 @@ pub unsafe extern "C" fn mmap(
 ) -> *mut c_void {
     // SAFETY: the caller's own arguments, with the protection and flags
     // rewritten into this host's spelling of the same request.
-    unsafe {
+    let mapped = unsafe {
         libc::mmap(
             addr,
             len,
@@ -241,7 +271,11 @@ pub unsafe extern "C" fn mmap(
             map_fd(flags, fd),
             off as libc::off_t,
         )
+    };
+    if mapped != libc::MAP_FAILED && is_anonymous(flags) && flags & darwin::MAP_PRIVATE != 0 {
+        advise_huge(mapped, len);
     }
+    mapped
 }
 
 pub unsafe extern "C" fn munmap(addr: *mut c_void, len: usize) -> i32 {

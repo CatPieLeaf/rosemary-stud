@@ -165,6 +165,23 @@ pub trait AddressSpace {
         Ok(0)
     }
 
+    /// Ask for `[addr, addr+len)`, not yet written, to be backed by huge
+    /// pages, and say whether any of it will be. A range a space says yes to
+    /// is then written rather than mapped from its file: only anonymous memory
+    /// takes huge pages here. The default asks for nothing.
+    fn advise_huge(&mut self, addr: Word, len: usize) -> bool {
+        let _ = (addr, len);
+        false
+    }
+
+    /// Have the whole huge pages of `[addr, addr+len)`, written since
+    /// [`advise_huge`](Self::advise_huge) said yes, assembled now: a fault that
+    /// found no free huge page took small ones, and those would otherwise stay
+    /// small until the kernel's background scan. The default does nothing.
+    fn collapse_huge(&mut self, addr: Word, len: usize) {
+        let _ = (addr, len);
+    }
+
     /// Read `out.len()` bytes from absolute address `addr`.
     fn read(&self, addr: Word, out: &mut [u8]) -> Result<()>;
 

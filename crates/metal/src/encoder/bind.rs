@@ -8,11 +8,12 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
         // SAFETY: an encoder is only made by a command buffer of this crate's.
         unsafe { object::body::<CommandBuffer>(command_buffer) }.flush_hazards();
     }
+    let (bound, set_cache, wanted, dynamic_offsets, descriptor_scratch, attachments) =
+        Encoder::scratch_fields(super::EncoderScratch::take());
     // An encoder is vended autoreleased, as Metal vends one, and reads its
     // command buffer for as long as it lives - so it holds a reference to it
     // rather than trusting the guest to outlive the encoder it made.
-    objc::arc::autorelease(object::make(
-        c"RosemaryMTLCommandEncoder",
+    objc::arc::autorelease(object::make_with(c"RosemaryMTLCommandEncoder", move || {
         Encoder {
             command_buffer: objc::arc::retain(command_buffer),
             kind,
@@ -43,16 +44,17 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             render_variant: None,
             render_dynamic: None,
             compute_variant: None,
-            attachments: Vec::new(),
+            attachments,
             writes_elsewhere: false,
-            bound: Default::default(),
-            set_cache: Default::default(),
-            wanted: Default::default(),
-            dynamic_offsets: Vec::new(),
+            bound,
+            set_cache,
+            wanted,
+            dynamic_offsets,
             vertex_buffers: [(vk::Buffer::null(), 0); SLOTS],
             index_buffer: (vk::Buffer::null(), 0, vk::IndexType::UINT16),
-        },
-    ))
+            descriptor_scratch,
+        }
+    }))
 }
 
 /// `-[MTLCommandEncoder dealloc]`.
@@ -67,6 +69,7 @@ pub(super) unsafe extern "C" fn encoder_dealloc(receiver: Id, _sel: Sel) {
         &mut encoder.command_buffer,
         std::ptr::null_mut(),
     ));
+    encoder.give_back_scratch();
     // SAFETY: the body was established by `object::make` and is not read again.
     unsafe { std::ptr::drop_in_place(encoder as *mut Encoder) };
     objc::arc::finalize(receiver);
@@ -530,9 +533,13 @@ impl Encoder {
         }
 
         if fresh.iter().any(|fresh| *fresh) {
-            let mut buffer_infos = Vec::new();
-            let mut image_infos = Vec::new();
-            let mut texel_views = Vec::new();
+            let mut scratch = std::mem::take(&mut self.descriptor_scratch);
+            scratch.clear();
+            let super::DescriptorScratch {
+                buffer_infos,
+                image_infos,
+                texel_views,
+            } = &mut scratch;
             for index in (0..SETS).filter(|index| fresh[*index]) {
                 for entry in &self.set_cache[index].entries {
                     use vk::Handle;
@@ -596,6 +603,8 @@ impl Encoder {
             for index in (0..SETS).filter(|index| fresh[*index]) {
                 command.remember_set(layouts[index], &self.set_cache[index].entries, sets[index]);
             }
+            drop(writes);
+            self.descriptor_scratch = scratch;
         }
         Some(sets)
     }
@@ -637,9 +646,13 @@ impl Encoder {
             .filter(|(at, entry)| !incremental || cache.entries[*at] != **entry)
             .map(|(_, entry)| entry);
 
-        let mut buffer_infos = Vec::new();
-        let mut image_infos = Vec::new();
-        let mut texel_views = Vec::new();
+        let mut scratch = std::mem::take(&mut self.descriptor_scratch);
+        scratch.clear();
+        let super::DescriptorScratch {
+            buffer_infos,
+            image_infos,
+            texel_views,
+        } = &mut scratch;
         for entry in changed.clone() {
             use vk::Handle;
             match entry.kind {
@@ -702,6 +715,8 @@ impl Encoder {
             )
         };
         stats::add(Counter::PushDescriptorWrites, writes.len() as u64);
+        drop(writes);
+        self.descriptor_scratch = scratch;
         let cache = &mut self.set_cache[index];
         cache.layout = layout;
         cache.set = vk::DescriptorSet::null();

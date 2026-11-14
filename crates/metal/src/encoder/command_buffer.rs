@@ -1,5 +1,10 @@
 use super::*;
 
+/// How many objects the last committed command buffer retained: a game's
+/// frames are alike, so the next one starts with room for as many rather than
+/// growing its list and set from nothing again.
+static RETAINED_LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a command queue of this crate's.
     let queue = unsafe { object::body::<CommandQueue>(receiver) };
@@ -44,6 +49,7 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
     }
     let profile = crate::profile::Profile::begin(gpu, command_buffer);
     stats::count(Counter::CommandBuffers);
+    let retained_room = RETAINED_LAST.load(std::sync::atomic::Ordering::Relaxed);
     // `-commandBuffer` owns nothing it hands back: Metal vends an autoreleased
     // command buffer, and a guest which keeps one retains it itself.
     objc::arc::autorelease(object::make(
@@ -60,8 +66,8 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
             descriptor_pools: Vec::new(),
             written_sets: Default::default(),
             hazards: Hazards::default(),
-            retained: Vec::new(),
-            retained_set: AddressSet::default(),
+            retained: Vec::with_capacity(retained_room),
+            retained_set: AddressSet::with_capacity_and_hasher(retained_room, Default::default()),
             uploads: Vec::new(),
             upload_used: 0,
             snapshots: Vec::new(),
@@ -410,6 +416,7 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
         },
         retained: {
             command.retained_set.clear();
+            RETAINED_LAST.store(command.retained.len(), std::sync::atomic::Ordering::Relaxed);
             std::mem::take(&mut command.retained)
         },
         uploads: std::mem::take(&mut command.uploads),

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 use crate::address::AddressMap;
@@ -42,6 +43,53 @@ fn os_object_refcount(object: Id) -> Option<&'static OsObjectRefcount> {
     std::ptr::eq(class, crate::class::os_object_class()).then_some(refcount)
 }
 
+/// Where `object` of a class counted inline keeps its extra references.
+fn inline_count<'a>(object: Id, class: Option<&'static crate::class::Class>) -> Option<&'a AtomicUsize> {
+    let offset = class?.inline_count_offset()?;
+    // SAFETY: `count_inline`'s contract: every instance of the class was made
+    // by `create_instance`, at least `offset` plus one word long, and the word
+    // is aligned because the instance size is a whole number of words.
+    Some(unsafe { &*((object as *mut u8).add(offset) as *const AtomicUsize) })
+}
+
+/// `object`'s class, if `object` is one this runtime counts at all.
+fn counted_class(object: Id) -> Option<&'static crate::class::Class> {
+    // SAFETY: a live object, whose first word is the `isa`.
+    unsafe { crate::object::class_of(object) }
+}
+
+/// Carry `object`'s extra references from the storage `from` counts them in
+/// to the storage `to` does, for an object whose class is being replaced.
+pub(crate) fn move_count(
+    object: Id,
+    from: Option<&'static crate::class::Class>,
+    to: &'static crate::class::Class,
+) {
+    let (old, new) = (inline_count(object, from), inline_count(object, Some(to)));
+    if old.is_none() && new.is_none() {
+        return;
+    }
+    let extra = match old {
+        Some(word) => word.swap(0, Ordering::AcqRel),
+        None => counts(object).remove(&(object as usize)).unwrap_or(0),
+    };
+    match new {
+        Some(word) => word.store(extra, Ordering::Release),
+        None if extra > 0 => {
+            counts(object).insert(object as usize, extra);
+        }
+        None => {}
+    }
+}
+
+/// Start a fresh copy of an inline-counted object at one reference: the
+/// bytes it was copied from carried the original's count.
+pub(crate) fn reset_inline_count(object: Id) {
+    if let Some(word) = inline_count(object, counted_class(object)) {
+        word.store(0, Ordering::Release);
+    }
+}
+
 /// Add a reference. Returns `object`, as `objc_retain` does.
 pub fn retain(object: Id) -> Id {
     if object.is_null() {
@@ -57,6 +105,12 @@ pub fn retain(object: Id) -> Id {
     // SAFETY: a live object, whose first word is the `isa`.
     if unsafe { crate::block::is_block(object) } {
         return crate::block::copy(object);
+    }
+    if let Some(word) = inline_count(object, counted_class(object)) {
+        if word.fetch_add(1, Ordering::Relaxed) == usize::MAX && crate::debug::enabled() {
+            crate::fail!("objc debug: retain count overflow for {object:p}");
+        }
+        return object;
     }
     if let Some(refcount) = os_object_refcount(object) {
         (refcount.retain)(object);
@@ -86,6 +140,10 @@ pub fn make_immortal(object: Id) {
     if unsafe { crate::block::is_block(object) } || os_object_refcount(object).is_some() {
         crate::fail!("make_immortal: {object:p} does not use this runtime's refcount");
     }
+    if let Some(word) = inline_count(object, counted_class(object)) {
+        word.store(usize::MAX / 2, Ordering::Release);
+        return;
+    }
     counts(object).insert(object as usize, usize::MAX / 2);
 }
 
@@ -105,6 +163,15 @@ pub fn release(object: Id) {
     // SAFETY: a live object; see [`retain`].
     if unsafe { crate::block::is_block(object) } {
         return crate::block::release(object);
+    }
+    if let Some(word) = inline_count(object, counted_class(object)) {
+        // Zero extra references is a count of one, as in the table: the
+        // release which finds zero is the last.
+        if word.fetch_sub(1, Ordering::Release) != 0 {
+            return;
+        }
+        std::sync::atomic::fence(Ordering::Acquire);
+        return deallocate(object);
     }
     if let Some(refcount) = os_object_refcount(object) {
         return (refcount.release)(object);
@@ -139,12 +206,19 @@ pub fn retain_count(object: Id) -> usize {
     if let Some(refcount) = os_object_refcount(object) {
         return (refcount.count)(object);
     }
+    if let Some(word) = inline_count(object, counted_class(object)) {
+        return 1 + word.load(Ordering::Acquire);
+    }
     1 + counts(object).get(&(object as usize)).copied().unwrap_or(0)
 }
 
 /// Drop `object`'s entry, which an entry at zero outlives every reference
 /// to, before its memory is reused for another object.
 pub(crate) fn forget_count(object: Id) {
+    // An inline count goes with the memory it lives in.
+    if inline_count(object, counted_class(object)).is_some() {
+        return;
+    }
     counts(object).remove(&(object as usize));
 }
 
@@ -353,6 +427,16 @@ fn unregister_weak(slot: *mut Id) {
 
 /// Zero every weak slot that pointed at `object`.
 fn clear_weak_references(object: Id) {
+    // Asked under the shared lock first: nearly every object freed was never
+    // pointed at weakly, and the exclusive lock would serialize every thread
+    // freeing anything.
+    if !WEAK
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&(object as usize))
+    {
+        return;
+    }
     let Some(slots) = WEAK
         .write()
         .unwrap_or_else(|e| e.into_inner())
@@ -541,6 +625,14 @@ pub fn remove_associated(object: Id) {
     if !ANY_ASSOCIATED.load(std::sync::atomic::Ordering::Acquire) || object.is_null() {
         return;
     }
+    // As for weak references: the shared lock answers the common case.
+    if !ASSOCIATIONS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&(object as usize))
+    {
+        return;
+    }
     let removed = ASSOCIATIONS
         .write()
         .unwrap_or_else(|e| e.into_inner())
@@ -603,5 +695,67 @@ mod lifetime_tests {
         assert_eq!(DEALLOCATED.load(Ordering::SeqCst), 0);
         release(object);
         assert_eq!(DEALLOCATED.load(Ordering::SeqCst), 1);
+    }
+
+    static INLINE_FREED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn inline_dealloc(object: Id, _sel: crate::sel::Sel) {
+        INLINE_FREED.fetch_add(1, Ordering::SeqCst);
+        finalize(object);
+    }
+
+    /// A class with two words past the `isa`: a payload and the count.
+    fn two_word_class(name: &std::ffi::CStr, inline: bool) -> &'static crate::class::Class {
+        crate::bootstrap();
+        let nsobject = crate::class::lookup(c"NSObject").expect("NSObject");
+        let class = crate::class::allocate_pair(Some(nsobject), name, 2 * size_of::<usize>())
+            .expect("an unused name");
+        assert!(class.add_method(
+            crate::sel::get("dealloc"),
+            inline_dealloc as crate::class::Imp,
+            c"v16@0:8",
+        ));
+        crate::class::register_pair(class);
+        if inline {
+            class.count_inline();
+        }
+        class
+    }
+
+    /// An inline count lives in the instance, follows the object across a
+    /// class change in both directions, starts a copy afresh, and frees at the
+    /// last release.
+    #[test]
+    fn an_inline_count_lives_in_the_instance_and_frees_at_the_last_release() {
+        let inline = two_word_class(c"RosemaryInlineCounted", true);
+        let table = two_word_class(c"RosemaryTableCounted", false);
+        let object = crate::object::create_instance(inline, 0);
+        let word = inline_count(object, Some(inline)).expect("counted inline");
+
+        retain(object);
+        retain(object);
+        assert_eq!(word.load(Ordering::SeqCst), 2);
+        assert_eq!(retain_count(object), 3);
+        assert!(!counts(object).contains_key(&(object as usize)));
+
+        // SAFETY: both classes have the same layout.
+        unsafe { crate::object::set_class(object, table) };
+        assert_eq!(retain_count(object), 3);
+        assert_eq!(counts(object).get(&(object as usize)), Some(&2));
+        // SAFETY: as above.
+        unsafe { crate::object::set_class(object, inline) };
+        assert_eq!(word.load(Ordering::SeqCst), 2);
+        assert!(!counts(object).contains_key(&(object as usize)));
+
+        // SAFETY: a live object of a registered class.
+        let copy = unsafe { crate::api::object_copy(object, 0) };
+        assert_eq!(retain_count(copy), 1);
+
+        release(object);
+        release(object);
+        assert_eq!(INLINE_FREED.load(Ordering::SeqCst), 0);
+        release(object);
+        release(copy);
+        assert_eq!(INLINE_FREED.load(Ordering::SeqCst), 2);
     }
 }

@@ -10,22 +10,45 @@ pub(crate) struct Object<T> {
 }
 
 /// Declare a Metal class whose instances carry a `T`.
+///
+/// Each instance also keeps its reference count in a word after the body: a
+/// frame retains and releases Metal objects by the thousand, and the runtime's
+/// shared table took a lock for every one. Only the runtime allocates a Metal
+/// object, which is what [`Class::count_inline`] requires.
 pub(crate) fn register<T>(name: &CStr) -> &'static Class {
-    corefoundation::base::register(name, None, size_of::<Object<T>>(), false)
+    let fresh = objc::class::lookup(name).is_none();
+    let word = size_of::<usize>();
+    let size = size_of::<Object<T>>().next_multiple_of(word) + word;
+    let class = corefoundation::base::register(name, None, size, false);
+    if fresh && class.instance_size() == size {
+        class.count_inline();
+    }
+    class
 }
 
 /// Allocate one instance of a declared class and install its body.
 pub(crate) fn make<T>(name: &CStr, body: T) -> Id {
+    make_with(name, move || body)
+}
+
+/// [`make`] with a body built only once its memory exists, so that a large one
+/// - an encoder's binding tables are kilobytes - is written straight into the
+/// instance rather than built elsewhere and copied in.
+pub(crate) fn make_with<T>(name: &CStr, body: impl FnOnce() -> T) -> Id {
     let class = objc::class::lookup(name).expect("Metal is bootstrapped");
-    // SAFETY: `Object<T>` is the layout `register::<T>` declared for this class.
-    let object = unsafe { corefoundation::base::allocate::<Object<T>>(class) };
+    assert!(
+        class.instance_size() >= size_of::<Object<T>>(),
+        "{} was registered smaller than its body",
+        class.name_str()
+    );
+    // The body is written whole below, so the memory is not zeroed first.
+    let object = objc::object::create_instance_unzeroed(class) as *mut Object<T>;
     if object.is_null() {
         return std::ptr::null_mut();
     }
-    // `allocate` initializes only the Objective-C header, so the body is
-    // uninitialized memory: write through it without dropping first.
-    // SAFETY: a fresh instance whose body is this call's to establish.
-    unsafe { std::ptr::addr_of_mut!((*object).body).write(body) };
+    // SAFETY: a fresh instance of the layout `register::<T>` declared, whose
+    // body is uninitialized memory this call establishes without dropping.
+    unsafe { std::ptr::addr_of_mut!((*object).body).write(body()) };
     object as Id
 }
 

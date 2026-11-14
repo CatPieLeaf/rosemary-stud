@@ -202,12 +202,22 @@ pub fn map_segments_from<S: MachSpec, M: AddressSpace>(
             what: "segment contents",
         })?;
         let addr = seg.vmaddr.wrapping_add(slide);
+        // Code the host runs is copied onto huge pages where the space offers
+        // them, rather than mapped from the file in small ones: a game's code
+        // is a hundred megabytes, and its main thread spent a measurable share
+        // of its time walking page tables for instructions.
+        let huge = obj.spec().natively_executable()
+            && seg.prot().exec
+            && mem.advise_huge(addr, src.len());
         let mapped = match file {
-            Some(f) => mem.map_file(addr, f.path, f.offset + range.start as u64, src)?,
-            None => 0,
+            Some(f) if !huge => mem.map_file(addr, f.path, f.offset + range.start as u64, src)?,
+            _ => 0,
         };
         if mapped < src.len() {
             mem.write(addr + mapped as Word, &src[mapped..])?;
+        }
+        if huge {
+            mem.collapse_huge(addr, src.len());
         }
     }
 

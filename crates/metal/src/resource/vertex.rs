@@ -141,13 +141,24 @@ pub(super) unsafe extern "C" fn collection_assign(
 ) {
     // SAFETY: an indexed collection of this crate's.
     let collection = unsafe { object::body::<IndexedCollection>(receiver) };
-    if let Some(element) = collection.elements.get(index) {
-        (collection.assign)(*element, object);
+    if let Some(element) = collection.element(index) {
+        (collection.assign)(element, object);
     }
 }
 
+/// A descriptor's `-colorAttachments`, `-layouts` or `-attributes`.
+///
+/// Its elements are made on first use: a render pass descriptor a game makes
+/// every pass touches one or two of its eight colour attachments, and making
+/// and freeing all eight was most of what a pass cost on the CPU.
 pub(crate) struct IndexedCollection {
+    /// One slot per index, null until [`IndexedCollection::element`] makes it.
     pub elements: Vec<Id>,
+    /// The descriptor elements are made for, until it orphans the collection.
+    pub owner: Id,
+    /// Make element `index` of `owner`, which may be null: an orphaned
+    /// collection's new elements hold their own values.
+    pub make: fn(Id, usize) -> Id,
     /// How to tell one of `elements` that its owner is gone. See [`orphan`].
     pub orphan: fn(Id),
     /// `collection[i] = object`: copy the values of a standalone descriptor,
@@ -165,6 +176,35 @@ pub(crate) struct IndexedCollection {
 /// side can break, so the owner instead *orphans* every element it vended on
 /// the way out, and an orphaned element's setters and getters do nothing
 /// rather than writing through a dangling pointer.
+impl IndexedCollection {
+    /// A collection of `count` elements of `owner`, none made yet.
+    pub(crate) fn new(
+        owner: Id,
+        count: usize,
+        make: fn(Id, usize) -> Id,
+        orphan: fn(Id),
+        assign: fn(Id, Id),
+    ) -> Self {
+        Self {
+            elements: vec![std::ptr::null_mut(); count],
+            owner,
+            make,
+            orphan,
+            assign,
+        }
+    }
+
+    /// Element `index`, made the first time it is asked for, or `None` past
+    /// the end.
+    pub(crate) fn element(&mut self, index: usize) -> Option<Id> {
+        let slot = self.elements.get_mut(index)?;
+        if slot.is_null() {
+            *slot = (self.make)(self.owner, index);
+        }
+        Some(*slot)
+    }
+}
+
 pub(crate) trait Element {
     fn owner(&mut self) -> &mut Id;
 }
@@ -186,7 +226,8 @@ pub(crate) fn orphan(collection: Id) {
     }
     // SAFETY: a collection of this crate's.
     let collection = unsafe { object::body::<IndexedCollection>(collection) };
-    for element in &collection.elements {
+    collection.owner = std::ptr::null_mut();
+    for element in collection.elements.iter().filter(|element| !element.is_null()) {
         (collection.orphan)(*element);
     }
 }
@@ -278,6 +319,25 @@ fn release_collections(descriptor: &mut VertexDescriptor) {
     }
 }
 
+fn make_vertex_element(owner: Id, index: usize, layout: bool) -> Id {
+    object::make(
+        c"RosemaryMTLVertexElement",
+        VertexElement {
+            owner,
+            index,
+            ..VertexElement::standalone(layout)
+        },
+    )
+}
+
+fn make_vertex_layout(owner: Id, index: usize) -> Id {
+    make_vertex_element(owner, index, true)
+}
+
+fn make_vertex_attribute(owner: Id, index: usize) -> Id {
+    make_vertex_element(owner, index, false)
+}
+
 pub(super) fn vertex_collection(receiver: Id, layout: bool) -> Id {
     // SAFETY: a vertex descriptor of this crate's.
     let descriptor = unsafe { object::body::<VertexDescriptor>(receiver) };
@@ -289,26 +349,21 @@ pub(super) fn vertex_collection(receiver: Id, layout: bool) -> Id {
     if !existing.is_null() {
         return existing;
     }
-    let elements = (0..VERTEX_SLOTS)
-        .map(|index| {
-            object::make(
-                c"RosemaryMTLVertexElement",
-                VertexElement {
-                    owner: receiver,
-                    index,
-                    ..VertexElement::standalone(layout)
-                },
-            )
-        })
-        .collect::<Vec<_>>();
+    let make = if layout {
+        make_vertex_layout
+    } else {
+        make_vertex_attribute
+    };
     let collection = object::make(
         c"RosemaryMTLIndexedCollection",
-        IndexedCollection {
-            elements,
+        IndexedCollection::new(
+            receiver,
+            VERTEX_SLOTS,
+            make,
             // SAFETY: every element of this collection is an `RosemaryMTLVertexElement`.
-            orphan: |element| unsafe { orphan_element::<VertexElement>(element) },
-            assign: assign_vertex_element,
-        },
+            |element| unsafe { orphan_element::<VertexElement>(element) },
+            assign_vertex_element,
+        ),
     );
     let descriptor = unsafe { object::body::<VertexDescriptor>(receiver) };
     if layout {
@@ -330,9 +385,7 @@ pub(super) unsafe extern "C" fn vertex_attributes(receiver: Id, _sel: Sel) -> Id
 pub(super) unsafe extern "C" fn indexed_element(receiver: Id, _sel: Sel, index: usize) -> Id {
     // SAFETY: an indexed collection of this crate's.
     unsafe { object::body::<IndexedCollection>(receiver) }
-        .elements
-        .get(index)
-        .copied()
+        .element(index)
         .unwrap_or(std::ptr::null_mut())
 }
 

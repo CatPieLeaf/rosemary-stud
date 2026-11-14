@@ -1004,31 +1004,28 @@ pub(super) unsafe extern "C" fn pass_color_attachments(receiver: Id, _sel: Sel) 
     if !descriptor.color_objects.is_null() {
         return descriptor.color_objects;
     }
-    let elements = (0..RENDER_TARGETS)
-        .map(|index| {
-            object::make(
-                c"RosemaryMTLRenderPassAttachmentDescriptor",
-                AttachmentElement::new(receiver, AttachmentSlot::Color(index)),
-            )
-        })
-        .collect::<Vec<_>>();
     let collection = object::make(
         c"RosemaryMTLIndexedCollection",
-        crate::resource::IndexedCollection {
-            elements,
+        crate::resource::IndexedCollection::new(
+            receiver,
+            RENDER_TARGETS,
+            |owner, index| {
+                object::make(
+                    c"RosemaryMTLRenderPassAttachmentDescriptor",
+                    AttachmentElement::new(owner, AttachmentSlot::Color(index)),
+                )
+            },
             // SAFETY: every element here is an
             // `RosemaryMTLRenderPassAttachmentDescriptor`.
-            orphan: |element| unsafe {
-                crate::resource::orphan_element::<AttachmentElement>(element)
-            },
-            assign: |element, source| {
+            |element| unsafe { crate::resource::orphan_element::<AttachmentElement>(element) },
+            |element, source| {
                 // SAFETY: an attachment element of this crate's.
                 let slot = unsafe { object::body::<AttachmentElement>(element) }.slot;
                 if let Some(destination) = attachment_of(element) {
                     assign_attachment(destination, source, slot);
                 }
             },
-        },
+        ),
     );
     unsafe { object::body::<RenderPassDescriptor>(receiver) }.color_objects = collection;
     collection
@@ -1412,7 +1409,9 @@ mod tests {
                 pass,
                 objc::sel::get("depthAttachment"),
             ));
-            let color = object::body::<crate::resource::IndexedCollection>(colors).elements[0];
+            let color = object::body::<crate::resource::IndexedCollection>(colors)
+                .element(0)
+                .expect("attachment 0");
             set_attachment_number(color, objc::sel::get("setLoadAction:"), 2);
             render_pass_descriptor_init(pass, objc::sel::get("init"));
             assert_eq!(
@@ -1427,6 +1426,41 @@ mod tests {
             }
             objc::arc::release(colors);
             objc::arc::release(depth);
+        }
+    }
+
+    #[test]
+    fn colour_attachments_are_made_when_first_asked_for() {
+        crate::bootstrap();
+        let pass = object::make(c"MTLRenderPassDescriptor", RenderPassDescriptor::default());
+        // SAFETY: the registered methods of a descriptor this test made.
+        unsafe {
+            let colors = objc::arc::retain(pass_color_attachments(
+                pass,
+                objc::sel::get("colorAttachments"),
+            ));
+            let collection = object::body::<crate::resource::IndexedCollection>(colors);
+            assert!(collection.elements.iter().all(|element| element.is_null()));
+            let second = collection.element(1).expect("attachment 1");
+            assert_eq!(collection.element(1), Some(second));
+            assert_eq!(
+                collection.elements.iter().filter(|element| !element.is_null()).count(),
+                1
+            );
+            set_attachment_number(second, objc::sel::get("setStoreAction:"), 0);
+            assert_eq!(
+                object::body::<RenderPassDescriptor>(pass).colors[1].store_action,
+                0
+            );
+            assert!(collection.element(RENDER_TARGETS).is_none());
+
+            // One made after the descriptor went holds its own values.
+            objc::arc::release(pass);
+            let late = collection.element(2).expect("attachment 2");
+            assert!(object::body::<AttachmentElement>(late).owner.is_null());
+            set_attachment_number(late, objc::sel::get("setLoadAction:"), 2);
+            assert_eq!(attachment_of(late).map(|a| a.load_action), Some(2));
+            objc::arc::release(colors);
         }
     }
 }
