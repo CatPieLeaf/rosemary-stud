@@ -19,6 +19,23 @@ mod server_cli;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// `ROSEMARY_REFUSED_PROGRAMS`: executable names, separated by `:`, that are
+/// never run. A launcher that installs and updates the program itself lists
+/// the program's own updater here, so it cannot replace the build underneath
+/// it; the program sees its updater fail, as it would on a failed download.
+/// Set by the launcher, inherited by every process of the prefix.
+fn refused(path: &str) -> bool {
+    let Some(list) = std::env::var_os("ROSEMARY_REFUSED_PROGRAMS") else {
+        return false;
+    };
+    let Some(name) = std::path::Path::new(path).file_name() else {
+        return false;
+    };
+    list.to_string_lossy()
+        .split(':')
+        .any(|refused| !refused.is_empty() && name == std::ffi::OsStr::new(refused))
+}
+
 /// Load and execute, with `argv[0]` the path as the guest will see it.
 ///
 /// `path` is this host's - it is what gets opened - and `guest` is the spelling
@@ -31,6 +48,10 @@ fn run(
     policy: ImportPolicy,
     forced: Option<Engine>,
 ) -> ExitCode {
+    if refused(path) {
+        eprintln!("rosemary: {path}: not run, ROSEMARY_REFUSED_PROGRAMS names it");
+        return ExitCode::FAILURE;
+    }
     darwin::spawn::set_emulated(forced == Some(Engine::Emulated));
     let mut argv = vec![OsString::from(guest)];
     argv.extend(args);
