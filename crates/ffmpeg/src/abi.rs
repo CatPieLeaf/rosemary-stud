@@ -1,5 +1,5 @@
 //! The FFmpeg structure fields this tree touches, by offset, and the
-//! constants it needs. They are libavcodec 62 / libavutil 60's (FFmpeg 8);
+//! constants it needs. They are libavcodec 63 / libavutil 61's (FFmpeg 9);
 //! [`super::api`] refuses any other major version rather than guess, and the
 //! test below checks the numbers against the installed headers.
 //!
@@ -10,8 +10,8 @@
 use std::ffi::c_void;
 
 /// The library majors these offsets are for.
-pub const AVCODEC_MAJOR: u32 = 62;
-pub const AVUTIL_MAJOR: u32 = 60;
+pub const AVCODEC_MAJOR: u32 = 63;
+pub const AVUTIL_MAJOR: u32 = 61;
 
 /// `AVCodecContext`.
 pub mod context {

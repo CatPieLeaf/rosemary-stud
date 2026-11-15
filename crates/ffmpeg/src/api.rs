@@ -12,7 +12,7 @@ use super::abi;
 type Ptr = *mut c_void;
 type Const = *const c_void;
 
-/// The entry points, by the prototypes FFmpeg 8's headers give them.
+/// The entry points, by the prototypes FFmpeg 9's headers give them.
 pub struct Api {
     pub avcodec_version: unsafe extern "C" fn() -> u32,
     pub avcodec_find_decoder_by_name: unsafe extern "C" fn(*const c_char) -> Const,
@@ -161,7 +161,7 @@ impl Api {
             unsafe { ((api.avcodec_version)() >> 16, (api.avutil_version)() >> 16) };
         if codec_major != abi::AVCODEC_MAJOR || util_major != abi::AVUTIL_MAJOR {
             return Err(format!(
-                "libavcodec {codec_major} / libavutil {util_major} is not the FFmpeg 8 \
+                "libavcodec {codec_major} / libavutil {util_major} is not the FFmpeg 9 \
                  (libavcodec {} / libavutil {}) this build knows the structures of",
                 abi::AVCODEC_MAJOR,
                 abi::AVUTIL_MAJOR
@@ -174,11 +174,11 @@ impl Api {
     }
 }
 
-/// The host's FFmpeg 8, shared by every backend that wants it - loaded once
+/// The host's FFmpeg 9, shared by every backend that wants it - loaded once
 /// per process regardless of how many ask.
 pub fn global() -> Result<&'static Api, &'static str> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
-    API.get_or_init(|| Api::load(c"libavcodec.so.62", c"libavutil.so.60"))
+    API.get_or_init(|| Api::load(c"libavcodec.so.63", c"libavutil.so.61"))
         .as_ref()
         .map_err(String::as_str)
 }
@@ -193,8 +193,8 @@ pub fn bogus() -> Result<&'static Api, &'static str> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(|| {
         Api::load(
-            c"librosemary-no-such-avcodec.so.62",
-            c"librosemary-no-such-avutil.so.60",
+            c"librosemary-no-such-avcodec.so.63",
+            c"librosemary-no-such-avutil.so.61",
         )
     })
     .as_ref()

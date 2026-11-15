@@ -1,7 +1,7 @@
 //! FFmpeg's H.264 decoder over a hardware API: one backend each for Vulkan
 //! Video, VA-API and CUDA (NVDEC).
 //!
-//! FFmpeg 8 is loaded with `dlopen` (see the `ffmpeg` crate), never linked,
+//! FFmpeg 9 is loaded with `dlopen` (see the `ffmpeg` crate), never linked,
 //! so a host without it only loses these backends. FFmpeg keeps the reference
 //! pictures and reorders; this side feeds it Annex B access units, refuses its
 //! software fallback (a hardware backend that quietly decodes on the CPU is
