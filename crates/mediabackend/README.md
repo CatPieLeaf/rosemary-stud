@@ -2,7 +2,7 @@
 
 Host-neutral compressed-video decoding interface for Rosemary. This crate is
 independent of VideoToolbox, CoreMedia, CoreVideo and Metal. It has two
-implementations: FFmpeg 8 or newer over a hardware API (`ffmpeg`, always built, loaded
+implementations: FFmpeg 7 or newer over a hardware API (`ffmpeg`, always built, loaded
 with `dlopen` at run time), and an **optional** GStreamer H.264 proof with
 CPU-mappable NV12, I420 and BGRA outputs.
 
@@ -80,7 +80,7 @@ CPU-mappable NV12, I420 and BGRA outputs.
 
 `ffmpeg::{VULKAN, VAAPI, CUDA}` drive FFmpeg's `h264` decoder through one
 hardware device API each. Nothing links FFmpeg: `libavcodec` and
-`libavutil` (FFmpeg 9's, else FFmpeg 8's) are opened on first use, and a host without them, or with
+`libavutil` (the newest FFmpeg the host has, 7 or later) are opened on first use, and a host without them, or with
 another major version, only loses these backends. Each backend opens its
 device once per process and decodes a six-picture High-profile probe clip
 (`src/ffmpeg/probe.h264`) before it is used; VA-API tries every render node

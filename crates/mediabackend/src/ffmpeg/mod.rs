@@ -1,7 +1,7 @@
 //! FFmpeg's H.264 decoder over a hardware API: one backend each for Vulkan
 //! Video, VA-API and CUDA (NVDEC).
 //!
-//! FFmpeg 8 or newer is loaded with `dlopen` (see the `ffmpeg` crate), never linked,
+//! FFmpeg 7 or newer is loaded with `dlopen` (see the `ffmpeg` crate), never linked,
 //! so a host without it only loses these backends. FFmpeg keeps the reference
 //! pictures and reorders; this side feeds it Annex B access units, refuses its
 //! software fallback (a hardware backend that quietly decodes on the CPU is
@@ -584,8 +584,8 @@ impl Decoder {
                 abi::read::<c_int>(sw, abi::frame::FORMAT),
                 abi::read::<c_int>(hw, abi::frame::WIDTH),
                 abi::read::<c_int>(hw, abi::frame::HEIGHT),
-                abi::read::<usize>(hw, abi::frame::CROP_TOP),
-                abi::read::<usize>(hw, abi::frame::CROP_LEFT),
+                abi::read::<usize>(hw, self.api.frame.crop_top),
+                abi::read::<usize>(hw, self.api.frame.crop_left),
                 abi::read::<i64>(hw, abi::frame::PTS),
             )
         };
@@ -632,7 +632,7 @@ impl Decoder {
         }
         let id = u64::try_from(id).ok()?;
         // SAFETY: the decoded frame.
-        let layout = unsafe { frame_layout(hw, width, height, chroma_row) };
+        let layout = unsafe { frame_layout(self.api.frame, hw, width, height, chroma_row) };
         Some(Frame {
             id,
             layout,
@@ -699,6 +699,7 @@ impl Decoder {
 ///
 /// `frame` must be a live `AVFrame` holding a decoded picture.
 unsafe fn frame_layout(
+    moved: &abi::Frame,
     frame: *const c_void,
     width: usize,
     height: usize,
@@ -707,10 +708,10 @@ unsafe fn frame_layout(
     // SAFETY: as the caller promises, at `abi`'s offsets.
     let field = |offset| unsafe { abi::read::<c_int>(frame, offset) };
     let (sar_num, sar_den) = (
-        field(abi::frame::SAMPLE_ASPECT_RATIO),
-        field(abi::frame::SAMPLE_ASPECT_RATIO + size_of::<c_int>()),
+        field(moved.sample_aspect_ratio),
+        field(moved.sample_aspect_ratio + size_of::<c_int>()),
     );
-    let flags = field(abi::frame::FLAGS);
+    let flags = field(moved.flags);
     let interlaced = flags & abi::FRAME_FLAG_INTERLACED != 0;
     let repeat_first_field = field(abi::frame::REPEAT_PICT) == 1;
     let field_order = match (
@@ -729,7 +730,7 @@ unsafe fn frame_layout(
         offsets: vec![0, width * height],
         crop: None,
         pixel_aspect_ratio: aspect_ratio(sar_num, sar_den),
-        chroma_siting: match field(abi::frame::CHROMA_LOCATION) {
+        chroma_siting: match field(moved.chroma_location) {
             0 => ChromaSiting::Unknown,
             abi::CHROMA_LOC_LEFT => ChromaSiting::Mpeg2,
             abi::CHROMA_LOC_CENTER => ChromaSiting::Jpeg,
@@ -743,10 +744,10 @@ unsafe fn frame_layout(
         field_order,
         repeat_first_field,
         one_field: false,
-        matrix: matrix(field(abi::frame::COLORSPACE)),
-        primaries: primaries(field(abi::frame::COLOR_PRIMARIES)),
-        transfer: transfer(field(abi::frame::COLOR_TRC)),
-        full_range: match field(abi::frame::COLOR_RANGE) {
+        matrix: matrix(field(moved.colorspace)),
+        primaries: primaries(field(moved.color_primaries)),
+        transfer: transfer(field(moved.color_trc)),
+        full_range: match field(moved.color_range) {
             abi::RANGE_JPEG => Some(true),
             abi::RANGE_MPEG => Some(false),
             _ => None,

@@ -12,8 +12,10 @@ use super::abi;
 type Ptr = *mut c_void;
 type Const = *const c_void;
 
-/// The entry points, by the prototypes FFmpeg 8's and 9's headers give them.
+/// The entry points, by the prototypes FFmpeg 7's, 8's and 9's headers give
+/// them, and where this release's `AVFrame` keeps the fields that moved.
 pub struct Api {
+    pub frame: &'static abi::Frame,
     pub avcodec_version: unsafe extern "C" fn() -> u32,
     pub avcodec_find_decoder_by_name: unsafe extern "C" fn(*const c_char) -> Const,
     pub avcodec_get_hw_config: unsafe extern "C" fn(Const, c_int) -> Const,
@@ -129,7 +131,8 @@ impl Api {
             av_opt_set_int,
             av_log_set_level,
         );
-        let api = Api {
+        let mut api = Api {
+            frame: &abi::FRAME_8,
             avcodec_version,
             avcodec_find_decoder_by_name,
             avcodec_get_hw_config,
@@ -159,12 +162,16 @@ impl Api {
         // SAFETY: resolved entry points that take nothing.
         let (codec_major, util_major) =
             unsafe { ((api.avcodec_version)() >> 16, (api.avutil_version)() >> 16) };
-        if !abi::VERSIONS.contains(&(codec_major, util_major)) {
+        let Some(version) = abi::VERSIONS
+            .iter()
+            .find(|v| (v.avcodec, v.avutil) == (codec_major, util_major))
+        else {
             return Err(format!(
                 "libavcodec {codec_major} / libavutil {util_major} is not an FFmpeg this build \
-                 knows the structures of (FFmpeg 8 or 9)"
+                 knows the structures of (FFmpeg 7 or newer)"
             ));
-        }
+        };
+        api.frame = version.frame;
         // SAFETY: a resolved entry point. FFmpeg logs process-wide, and
         // nothing else here uses it, so errors only.
         unsafe { (api.av_log_set_level)(abi::LOG_ERROR) };
@@ -179,9 +186,11 @@ pub fn global() -> Result<&'static Api, &'static str> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(|| {
         let mut reasons = Vec::new();
-        for (codec, util) in abi::VERSIONS {
-            let codec = std::ffi::CString::new(format!("libavcodec.so.{codec}")).unwrap();
-            let util = std::ffi::CString::new(format!("libavutil.so.{util}")).unwrap();
+        for version in abi::VERSIONS {
+            let codec = format!("libavcodec.so.{}", version.avcodec);
+            let util = format!("libavutil.so.{}", version.avutil);
+            let codec = std::ffi::CString::new(codec).unwrap();
+            let util = std::ffi::CString::new(util).unwrap();
             match Api::load(&codec, &util) {
                 Ok(api) => return Ok(api),
                 Err(reason) => reasons.push(reason),

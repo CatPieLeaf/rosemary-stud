@@ -1,8 +1,10 @@
 //! The FFmpeg structure fields this tree touches, by offset, and the
-//! constants it needs. They hold for every FFmpeg in [`VERSIONS`]: FFmpeg 8
-//! (8.0 and 8.1) and FFmpeg 9 lay these fields out alike. [`super::api`]
-//! refuses any other major version rather than guess, and the test below
-//! checks the numbers against the installed headers.
+//! constants it needs. They hold for every FFmpeg in [`VERSIONS`]: FFmpeg 7,
+//! 8 and 9 lay these fields out alike, except the later half of `AVFrame`,
+//! which FFmpeg 8 moved by dropping deprecated fields before it; those are
+//! in a [`Frame`] per release. [`super::api`] refuses any other major
+//! version rather than guess, and the test below checks the numbers against
+//! the installed headers.
 //!
 //! Shared by `mediabackend` (H.264 through a hardware device context) and
 //! `coreaudio` (AAC through the software decoder): one set of offsets into
@@ -10,10 +12,85 @@
 
 use std::ffi::c_void;
 
-/// The FFmpeg releases these offsets are right for, as libavcodec and
-/// libavutil majors, newest first: FFmpeg 9, then FFmpeg 8. A new major
-/// joins the list once the test below passes against its headers.
-pub const VERSIONS: &[(u32, u32)] = &[(63, 61), (62, 60)];
+/// An FFmpeg release these offsets are right for.
+pub struct Version {
+    /// libavcodec's major version.
+    pub avcodec: u32,
+    /// libavutil's major version.
+    pub avutil: u32,
+    /// Where its `AVFrame` keeps the fields that moved.
+    pub frame: &'static Frame,
+}
+
+/// The FFmpeg releases this tree can use, newest first: 9, 8, then 7. A new
+/// major joins the list once the test below passes against its headers.
+pub const VERSIONS: &[Version] = &[
+    Version {
+        avcodec: 63,
+        avutil: 61,
+        frame: &FRAME_8,
+    },
+    Version {
+        avcodec: 62,
+        avutil: 60,
+        frame: &FRAME_8,
+    },
+    Version {
+        avcodec: 61,
+        avutil: 59,
+        frame: &FRAME_7,
+    },
+];
+
+/// The `AVFrame` fields from `sample_aspect_ratio` on, whose offsets FFmpeg 8
+/// changed. The rest of `AVFrame` is in [`frame`].
+pub struct Frame {
+    /// Video only, an `AVRational`: numerator, then denominator.
+    pub sample_aspect_ratio: usize,
+    /// Audio only.
+    pub sample_rate: usize,
+    /// Audio only, an `AVChannelLayout` (see [`ch_layout`]).
+    pub ch_layout: usize,
+    /// `AV_FRAME_FLAG_*`.
+    pub flags: usize,
+    pub color_range: usize,
+    pub color_primaries: usize,
+    pub color_trc: usize,
+    pub colorspace: usize,
+    pub chroma_location: usize,
+    pub crop_top: usize,
+    pub crop_left: usize,
+}
+
+/// FFmpeg 8 and 9.
+pub const FRAME_8: Frame = Frame {
+    sample_aspect_ratio: 124,
+    sample_rate: 180,
+    ch_layout: 384,
+    flags: 276,
+    color_range: 280,
+    color_primaries: 284,
+    color_trc: 288,
+    colorspace: 292,
+    chroma_location: 296,
+    crop_top: 344,
+    crop_left: 360,
+};
+
+/// FFmpeg 7.
+pub const FRAME_7: Frame = Frame {
+    sample_aspect_ratio: 128,
+    sample_rate: 192,
+    ch_layout: 408,
+    flags: 292,
+    color_range: 296,
+    color_primaries: 300,
+    color_trc: 304,
+    colorspace: 308,
+    chroma_location: 312,
+    crop_top: 368,
+    crop_left: 384,
+};
 
 /// `AVCodecContext`.
 pub mod context {
@@ -45,15 +122,13 @@ pub mod packet {
     pub const SIZE: usize = 32;
 }
 
-/// `AVFrame`.
+/// `AVFrame`, the fields every release in [`VERSIONS`] keeps in one place.
 pub mod frame {
     pub const DATA: usize = 0;
     pub const LINESIZE: usize = 64;
     pub const EXTENDED_DATA: usize = 96;
     pub const WIDTH: usize = 104;
     pub const HEIGHT: usize = 108;
-    /// Video only, an `AVRational`: numerator, then denominator.
-    pub const SAMPLE_ASPECT_RATIO: usize = 124;
     /// Both `enum AVPixelFormat` (video) and `enum AVSampleFormat` (audio):
     /// the same field, read as whichever the stream is.
     pub const FORMAT: usize = 116;
@@ -61,19 +136,6 @@ pub mod frame {
     pub const NB_SAMPLES: usize = 112;
     pub const PTS: usize = 136;
     pub const REPEAT_PICT: usize = 176;
-    /// Audio only.
-    pub const SAMPLE_RATE: usize = 180;
-    /// `AV_FRAME_FLAG_*`.
-    pub const FLAGS: usize = 276;
-    pub const COLOR_RANGE: usize = 280;
-    pub const COLOR_PRIMARIES: usize = 284;
-    pub const COLOR_TRC: usize = 288;
-    pub const COLORSPACE: usize = 292;
-    pub const CHROMA_LOCATION: usize = 296;
-    pub const CROP_TOP: usize = 344;
-    pub const CROP_LEFT: usize = 360;
-    /// Audio only, an `AVChannelLayout` (see [`super::ch_layout`]).
-    pub const CH_LAYOUT: usize = 384;
 }
 
 /// `AVCodecHWConfig`.
@@ -139,7 +201,7 @@ mod tests {
 
     /// Every number above, as the headers state it, in the order the C
     /// program prints them.
-    fn expected() -> Vec<(&'static str, i64)> {
+    fn expected(moved: &Frame) -> Vec<(&'static str, i64)> {
         vec![
             ("AVCodecContext.opaque", context::OPAQUE as i64),
             ("AVCodecContext.extradata", context::EXTRADATA as i64),
@@ -165,22 +227,22 @@ mod tests {
             ("AVFrame.height", frame::HEIGHT as i64),
             (
                 "AVFrame.sample_aspect_ratio",
-                frame::SAMPLE_ASPECT_RATIO as i64,
+                moved.sample_aspect_ratio as i64,
             ),
             ("AVFrame.nb_samples", frame::NB_SAMPLES as i64),
             ("AVFrame.format", frame::FORMAT as i64),
             ("AVFrame.pts", frame::PTS as i64),
             ("AVFrame.repeat_pict", frame::REPEAT_PICT as i64),
-            ("AVFrame.sample_rate", frame::SAMPLE_RATE as i64),
-            ("AVFrame.ch_layout", frame::CH_LAYOUT as i64),
-            ("AVFrame.flags", frame::FLAGS as i64),
-            ("AVFrame.color_range", frame::COLOR_RANGE as i64),
-            ("AVFrame.color_primaries", frame::COLOR_PRIMARIES as i64),
-            ("AVFrame.color_trc", frame::COLOR_TRC as i64),
-            ("AVFrame.colorspace", frame::COLORSPACE as i64),
-            ("AVFrame.chroma_location", frame::CHROMA_LOCATION as i64),
-            ("AVFrame.crop_top", frame::CROP_TOP as i64),
-            ("AVFrame.crop_left", frame::CROP_LEFT as i64),
+            ("AVFrame.sample_rate", moved.sample_rate as i64),
+            ("AVFrame.ch_layout", moved.ch_layout as i64),
+            ("AVFrame.flags", moved.flags as i64),
+            ("AVFrame.color_range", moved.color_range as i64),
+            ("AVFrame.color_primaries", moved.color_primaries as i64),
+            ("AVFrame.color_trc", moved.color_trc as i64),
+            ("AVFrame.colorspace", moved.colorspace as i64),
+            ("AVFrame.chroma_location", moved.chroma_location as i64),
+            ("AVFrame.crop_top", moved.crop_top as i64),
+            ("AVFrame.crop_left", moved.crop_left as i64),
             ("AVCodecHWConfig.pix_fmt", hw_config::PIX_FMT as i64),
             ("AVCodecHWConfig.methods", hw_config::METHODS as i64),
             ("AVCodecHWConfig.device_type", hw_config::DEVICE_TYPE as i64),
@@ -317,13 +379,16 @@ int main(void) {
             actual.remove(at).1 as u32
         };
         let installed = (major("AVCODEC_MAJOR"), major("AVUTIL_MAJOR"));
-        assert!(
-            VERSIONS.contains(&installed),
-            "the installed libavcodec {} / libavutil {} is not in VERSIONS",
-            installed.0,
-            installed.1
-        );
-        let expected = expected();
+        let version = VERSIONS
+            .iter()
+            .find(|v| (v.avcodec, v.avutil) == installed)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the installed libavcodec {} / libavutil {} is not in VERSIONS",
+                    installed.0, installed.1
+                )
+            });
+        let expected = expected(version.frame);
         assert_eq!(actual.len(), expected.len(), "{text}");
         for ((name, value), (want_name, want)) in actual.iter().zip(&expected) {
             assert_eq!(name, want_name);
