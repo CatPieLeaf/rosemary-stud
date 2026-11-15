@@ -2,6 +2,7 @@
 , stdenv
 , craneLib
 , pkg-config
+, shaderc
 , makeBinaryWrapper
 , patchelf
 , curl
@@ -12,6 +13,7 @@
 , openal
 , webkitgtk_6_0
 , libxkbcommon
+, ffmpeg
 , wayland
 , glib-networking
 , gst_all_1
@@ -31,6 +33,8 @@ let
       webkitgtk_6_0
       libxkbcommon
       wayland
+      # libavcodec and libavutil, opened by soname for video.
+      ffmpeg
     ];
 
   # WebKitGTK's media pipelines. GStreamer looks for plugins only in its own
@@ -85,7 +89,8 @@ let
     cargoExtraArgs = "--locked --package rosemary --bin rosemary";
     CARGO_PROFILE = if buildType == "debug" then "dev" else "release";
 
-    nativeBuildInputs = [ pkg-config ];
+    # glslc compiles the upscalers' shaders; without it they are left out.
+    nativeBuildInputs = [ pkg-config shaderc ];
     buildInputs = buildLibs;
 
     # The suite needs x86_64 Mach-O fixtures, a GPU and a display.
