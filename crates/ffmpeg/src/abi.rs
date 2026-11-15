@@ -1,7 +1,8 @@
 //! The FFmpeg structure fields this tree touches, by offset, and the
-//! constants it needs. They are libavcodec 63 / libavutil 61's (FFmpeg 9);
-//! [`super::api`] refuses any other major version rather than guess, and the
-//! test below checks the numbers against the installed headers.
+//! constants it needs. They hold for every FFmpeg in [`VERSIONS`]: FFmpeg 8
+//! (8.0 and 8.1) and FFmpeg 9 lay these fields out alike. [`super::api`]
+//! refuses any other major version rather than guess, and the test below
+//! checks the numbers against the installed headers.
 //!
 //! Shared by `mediabackend` (H.264 through a hardware device context) and
 //! `coreaudio` (AAC through the software decoder): one set of offsets into
@@ -9,9 +10,10 @@
 
 use std::ffi::c_void;
 
-/// The library majors these offsets are for.
-pub const AVCODEC_MAJOR: u32 = 63;
-pub const AVUTIL_MAJOR: u32 = 61;
+/// The FFmpeg releases these offsets are right for, as libavcodec and
+/// libavutil majors, newest first: FFmpeg 9, then FFmpeg 8. A new major
+/// joins the list once the test below passes against its headers.
+pub const VERSIONS: &[(u32, u32)] = &[(63, 61), (62, 60)];
 
 /// `AVCodecContext`.
 pub mod context {
@@ -204,8 +206,6 @@ mod tests {
                 "INPUT_BUFFER_PADDING_SIZE",
                 INPUT_BUFFER_PADDING_SIZE as i64,
             ),
-            ("AVCODEC_MAJOR", AVCODEC_MAJOR as i64),
-            ("AVUTIL_MAJOR", AVUTIL_MAJOR as i64),
         ]
     }
 
@@ -304,13 +304,25 @@ int main(void) {
         let output = std::process::Command::new(&binary).output().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let text = String::from_utf8(output.stdout).unwrap();
-        let actual: Vec<(String, i64)> = text
+        let mut actual: Vec<(String, i64)> = text
             .lines()
             .map(|line| {
                 let (name, value) = line.rsplit_once(' ').unwrap();
                 (name.to_string(), value.parse().unwrap())
             })
             .collect();
+        // The installed FFmpeg is one of the releases the offsets claim.
+        let mut major = |name: &str| {
+            let at = actual.iter().position(|(n, _)| n == name).unwrap();
+            actual.remove(at).1 as u32
+        };
+        let installed = (major("AVCODEC_MAJOR"), major("AVUTIL_MAJOR"));
+        assert!(
+            VERSIONS.contains(&installed),
+            "the installed libavcodec {} / libavutil {} is not in VERSIONS",
+            installed.0,
+            installed.1
+        );
         let expected = expected();
         assert_eq!(actual.len(), expected.len(), "{text}");
         for ((name, value), (want_name, want)) in actual.iter().zip(&expected) {

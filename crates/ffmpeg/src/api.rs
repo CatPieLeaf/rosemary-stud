@@ -12,7 +12,7 @@ use super::abi;
 type Ptr = *mut c_void;
 type Const = *const c_void;
 
-/// The entry points, by the prototypes FFmpeg 9's headers give them.
+/// The entry points, by the prototypes FFmpeg 8's and 9's headers give them.
 pub struct Api {
     pub avcodec_version: unsafe extern "C" fn() -> u32,
     pub avcodec_find_decoder_by_name: unsafe extern "C" fn(*const c_char) -> Const,
@@ -159,12 +159,10 @@ impl Api {
         // SAFETY: resolved entry points that take nothing.
         let (codec_major, util_major) =
             unsafe { ((api.avcodec_version)() >> 16, (api.avutil_version)() >> 16) };
-        if codec_major != abi::AVCODEC_MAJOR || util_major != abi::AVUTIL_MAJOR {
+        if !abi::VERSIONS.contains(&(codec_major, util_major)) {
             return Err(format!(
-                "libavcodec {codec_major} / libavutil {util_major} is not the FFmpeg 9 \
-                 (libavcodec {} / libavutil {}) this build knows the structures of",
-                abi::AVCODEC_MAJOR,
-                abi::AVUTIL_MAJOR
+                "libavcodec {codec_major} / libavutil {util_major} is not an FFmpeg this build \
+                 knows the structures of (FFmpeg 8 or 9)"
             ));
         }
         // SAFETY: a resolved entry point. FFmpeg logs process-wide, and
@@ -174,13 +172,25 @@ impl Api {
     }
 }
 
-/// The host's FFmpeg 9, shared by every backend that wants it - loaded once
-/// per process regardless of how many ask.
+/// The host's FFmpeg, the newest of [`abi::VERSIONS`] it has, shared by
+/// every backend that wants it - loaded once per process regardless of how
+/// many ask.
 pub fn global() -> Result<&'static Api, &'static str> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
-    API.get_or_init(|| Api::load(c"libavcodec.so.63", c"libavutil.so.61"))
-        .as_ref()
-        .map_err(String::as_str)
+    API.get_or_init(|| {
+        let mut reasons = Vec::new();
+        for (codec, util) in abi::VERSIONS {
+            let codec = std::ffi::CString::new(format!("libavcodec.so.{codec}")).unwrap();
+            let util = std::ffi::CString::new(format!("libavutil.so.{util}")).unwrap();
+            match Api::load(&codec, &util) {
+                Ok(api) => return Ok(api),
+                Err(reason) => reasons.push(reason),
+            }
+        }
+        Err(reasons.join("; "))
+    })
+    .as_ref()
+    .map_err(String::as_str)
 }
 
 /// A library that is never there, for the test that a missing FFmpeg
