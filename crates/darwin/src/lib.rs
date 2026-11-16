@@ -536,6 +536,8 @@ pub fn provider() -> machish::resolve::SyntheticDylib {
     // The zone registry, and its fork handlers ahead of any the guest installs.
     #[cfg(not(target_os = "macos"))]
     malloc::init();
+    #[cfg(target_os = "linux")]
+    vmmap::start_collapsing();
     let mut lib = machish::resolve::SyntheticDylib::new("<darwin>");
     lib.flat(true);
     for name in LIBRARY_NAMES {

@@ -246,6 +246,105 @@ pub(crate) fn advise_huge(addr: *mut c_void, len: usize) {
     let _ = (addr, len);
 }
 
+/// Keeps the guest's heap on huge pages. Advice only lets the kernel use one
+/// when a range is first touched and a free huge page is at hand; a heap
+/// touched while memory was fragmented stays on small pages, and khugepaged
+/// merges a few megabytes a pass - against gigabytes of game heap, whose
+/// loads then spend their time walking page tables. This thread merges, at
+/// khugepaged's own pace, every range of advised memory that is wholly
+/// resident and not yet huge, so it never adds a page the guest did not touch.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_collapsing() {
+    let Some(huge) = huge_page_size() else {
+        return;
+    };
+    let Some(pause) =
+        std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs")
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+    else {
+        return;
+    };
+    let _ = std::thread::Builder::new().name("rosemary-thp".to_string()).spawn(move || {
+        // The lowest priority there is: this work never competes with the
+        // guest's own. On Linux `setpriority` with 0 is the calling thread.
+        // SAFETY: a plain system call.
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) };
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(pause));
+            collapse_resident(huge);
+        }
+    });
+}
+
+/// One pass of [`start_collapsing`].
+#[cfg(target_os = "linux")]
+fn collapse_resident(huge: usize) {
+    let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") else {
+        return;
+    };
+    // SAFETY: a plain query.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let mut resident = vec![0u8; huge / page];
+    for (start, end) in mergeable(&smaps, huge) {
+        let mut chunk = start.next_multiple_of(huge);
+        while chunk + huge <= end {
+            // SAFETY: a range inside a mapping the kernel just listed; mincore
+            // reads nothing of it, and a mapping removed since only fails.
+            let whole = unsafe {
+                libc::mincore(chunk as *mut c_void, huge, resident.as_mut_ptr()) == 0
+            } && resident.iter().all(|state| state & 1 != 0);
+            if whole {
+                // SAFETY: advice over memory already resident; a range already
+                // huge, or one the kernel cannot merge, is left as it is.
+                unsafe { libc::madvise(chunk as *mut c_void, huge, libc::MADV_COLLAPSE) };
+            }
+            chunk += huge;
+        }
+    }
+}
+
+/// The private anonymous writable mappings in `smaps` advised for huge pages
+/// that hold at least one huge page's worth of small ones.
+#[cfg(target_os = "linux")]
+fn mergeable(smaps: &str, huge: usize) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut current: Option<(usize, usize)> = None;
+    let (mut rss, mut anon_huge) = (0usize, 0usize);
+    for line in smaps.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(first) = fields.next() else { continue };
+        if let Some((low, high)) = first.split_once('-')
+            && let (Ok(low), Ok(high)) = (usize::from_str_radix(low, 16), usize::from_str_radix(high, 16))
+        {
+            let perms = fields.next().unwrap_or("");
+            let inode = fields.nth(2).unwrap_or("");
+            let named = fields.next().is_some();
+            current = (perms.starts_with("rw") && perms.ends_with('p') && inode == "0" && !named)
+                .then_some((low, high));
+            (rss, anon_huge) = (0, 0);
+            continue;
+        }
+        let kib = |fields: &mut std::str::SplitWhitespace| {
+            fields.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0) * 1024
+        };
+        match first {
+            "Rss:" => rss = kib(&mut fields),
+            "AnonHugePages:" => anon_huge = kib(&mut fields),
+            "THPeligible:" => {
+                if let Some(range) = current.take()
+                    && fields.next() == Some("1")
+                    && rss.saturating_sub(anon_huge) >= huge
+                {
+                    found.push(range);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 /// `void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)`
 ///
 /// # Safety
@@ -494,5 +593,39 @@ mod tests {
             assert_eq!(p.cast::<u8>().read(), 0xa5);
             libc::munmap(p, len);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod collapse_tests {
+    use super::mergeable;
+
+    /// Only advised private anonymous writable mappings holding a huge
+    /// page's worth of small pages are merged.
+    #[test]
+    fn mergeable_picks_advised_anonymous_heap_with_small_pages() {
+        let smaps = "\
+7f0000000000-7f0040000000 rw-p 00000000 00:00 0
+Rss:              483000 kB
+AnonHugePages:     56000 kB
+THPeligible:    1
+7f0040000000-7f0050000000 rw-p 00000000 00:00 0
+Rss:              262144 kB
+AnonHugePages:    262144 kB
+THPeligible:    1
+7f0050000000-7f0060000000 rw-p 00000000 00:00 0
+Rss:              100000 kB
+AnonHugePages:         0 kB
+THPeligible:    0
+7f0060000000-7f0070000000 rw-p 00000000 00:2a 1234 /tmp/file
+Rss:              100000 kB
+AnonHugePages:         0 kB
+THPeligible:    1
+7f0070000000-7f0080000000 r--p 00000000 00:00 0
+Rss:              100000 kB
+AnonHugePages:         0 kB
+THPeligible:    1
+";
+        assert_eq!(mergeable(smaps, 2 << 20), vec![(0x7f0000000000, 0x7f0040000000)]);
     }
 }
