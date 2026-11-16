@@ -46,9 +46,40 @@ pub fn guard() -> Guard {
     }
 }
 
+/// The lock if it is free now (or this thread holds it already), without
+/// waiting. For a caller that has something better to do than wait out a
+/// present: polling events on the main thread, which would otherwise stall
+/// the game's frame for as long as the driver blocks in that present.
+pub fn try_guard() -> Option<Guard> {
+    let outer = DEPTH.with(|depth| depth.get() == 0);
+    let held = if outer {
+        match COMMITS.try_lock() {
+            Ok(held) => Some(held),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    } else {
+        None
+    };
+    DEPTH.with(|depth| depth.set(depth.get() + 1));
+    Some(Guard { _held: held })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_guard_never_waits_on_another_thread() {
+        let held = guard();
+        let other = std::thread::spawn(|| try_guard().is_none()).join().unwrap();
+        assert!(other, "another thread got the lock this one holds");
+        // This thread holds it, so it may take it again.
+        assert!(try_guard().is_some());
+        drop(held);
+        let free = std::thread::spawn(|| try_guard().is_some()).join().unwrap();
+        assert!(free, "a free lock was refused");
+    }
 
     #[test]
     fn a_thread_can_take_the_lock_it_holds() {
