@@ -1446,6 +1446,7 @@ mod tests {
 /// `kCGErrorSuccess` is `0`.
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::NSPoint) -> i32 {
+    sdl3::inputlog::line(|| format!("CGWarpMouseCursorPosition {:.0},{:.0} associated={}", point.x, point.y, mouse_is_associated()));
     let asked = point;
     let point = (point.x as f32, point.y as f32);
     // An edge hold is not the guest's relative mode: the warp is a plain one.
@@ -1716,6 +1717,9 @@ pub(crate) fn forget_recentring() {
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> i32 {
     let was = ASSOCIATED.swap(connected != 0, std::sync::atomic::Ordering::AcqRel);
+    if was != (connected != 0) {
+        sdl3::inputlog::line(|| format!("CGAssociateMouseAndMouseCursorPosition {connected}"));
+    }
     // The cursor stops where it is, which is what the guest is told from here.
     if connected == 0 && was {
         crate::event::settle_pointer();

@@ -51,6 +51,7 @@ pub fn warp(window: Window, x: f32, y: f32) -> Option<(f32, f32)> {
         return None;
     }
     let _commits = crate::compositor::guard();
+    crate::inputlog::line(|| format!("pointer warp through lock to {x:.0},{y:.0}"));
     let lifted = lift_constraints(window, (x, y));
     let warped = wayland::warp_through_lock(surface, x, y);
     if lifted.restore(window) {

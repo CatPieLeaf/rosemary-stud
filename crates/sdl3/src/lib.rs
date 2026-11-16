@@ -4,6 +4,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 pub mod compositor;
+pub mod inputlog;
 #[cfg(any(test, feature = "test-support"))]
 pub mod isolated;
 pub mod keycodes;
@@ -2030,6 +2031,7 @@ pub mod video {
         // rather than the main thread (the game's frame) waiting out a
         // present the driver may block in for a whole refresh.
         let Some(commits) = crate::compositor::try_guard() else {
+            crate::inputlog::line(|| "poll skipped: another thread holds the compositor guard".into());
             return None;
         };
         // SAFETY: a writable event of SDL's own size.
@@ -5260,6 +5262,7 @@ pub mod video {
         };
         // Leaving the mode warps the pointer back to SDL's position.
         let _commits = crate::compositor::guard();
+        crate::inputlog::line(|| format!("sdl set_relative_mouse_mode {enabled}"));
         // SAFETY: a window from SDL.
         unsafe { f(window, enabled) }
     }
@@ -5270,6 +5273,7 @@ pub mod video {
         let Some(f) = api().and_then(|a| a.SDL_SetWindowMouseGrab) else {
             return false;
         };
+        crate::inputlog::line(|| format!("sdl set_mouse_grab {grabbed}"));
         // SAFETY: a window from SDL.
         unsafe { f(window, grabbed) }
     }
