@@ -33,9 +33,6 @@ fn note_focus() {
         || windows
             .into_iter()
             .any(|window| sdl3::video::window_flags(window) & sdl3::video::flags::INPUT_FOCUS != 0);
-    if FOCUSED.load(std::sync::atomic::Ordering::Relaxed) != focused {
-        sdl3::inputlog::line(|| format!("focus flag now {focused}"));
-    }
     FOCUSED.store(focused, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -325,15 +322,6 @@ fn trace_views() {
 }
 
 pub(crate) fn deliver(event: sdl3::video::Event) {
-    if sdl3::inputlog::on() {
-        use sdl3::video::Event as E;
-        if matches!(
-            event,
-            E::Key { .. } | E::WindowFocus { .. } | E::MouseButton { .. } | E::WindowMouse { .. }
-        ) {
-            sdl3::inputlog::line(|| format!("sdl in {event:?}"));
-        }
-    }
     if !crate::dialog::deliver_modal(&event) {
         deliver_past_modal(event);
     }
@@ -1515,15 +1503,6 @@ pub(crate) fn handing_out(event: Id) {
     let Some(fields) = nsevent::fields_of(event) else {
         return;
     };
-    if sdl3::inputlog::on() && !matches!(fields.kind, kind::MOUSE_MOVED | kind::LEFT_MOUSE_DRAGGED | kind::RIGHT_MOUSE_DRAGGED | kind::OTHER_MOUSE_DRAGGED) {
-        sdl3::inputlog::line(|| format!(
-            "guest gets {} key_code={} modifiers={:#x} repeat={}",
-            responder_selector(fields.kind).unwrap_or("?"),
-            fields.key_code,
-            fields.modifiers,
-            fields.repeat
-        ));
-    }
     if fields.kind == kind::KEY_DOWN && !fields.window.is_null() {
         crate::text::begin_key_interpretation(responder_of(fields.window));
     }
