@@ -74,6 +74,24 @@ pub(super) fn write_mask(metal: u64) -> vk::ColorComponentFlags {
     mask
 }
 
+/// The four-component format a three-component 8- or 16-bit vertex format
+/// widens to, component for component; `None` for any other format.
+pub(crate) fn widened_vertex_format(format: vk::Format) -> Option<vk::Format> {
+    use vk::Format as F;
+    Some(match format {
+        F::R8G8B8_UINT => F::R8G8B8A8_UINT,
+        F::R8G8B8_SINT => F::R8G8B8A8_SINT,
+        F::R8G8B8_UNORM => F::R8G8B8A8_UNORM,
+        F::R8G8B8_SNORM => F::R8G8B8A8_SNORM,
+        F::R16G16B16_UINT => F::R16G16B16A16_UINT,
+        F::R16G16B16_SINT => F::R16G16B16A16_SINT,
+        F::R16G16B16_UNORM => F::R16G16B16A16_UNORM,
+        F::R16G16B16_SNORM => F::R16G16B16A16_SNORM,
+        F::R16G16B16_SFLOAT => F::R16G16B16A16_SFLOAT,
+        _ => return None,
+    })
+}
+
 /// `MTLVertexFormat` to `VkFormat`.
 pub(crate) fn vertex_format(metal: u64) -> Option<vk::Format> {
     use vk::Format as F;
@@ -136,6 +154,21 @@ pub(crate) fn vertex_format(metal: u64) -> Option<vk::Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn three_component_vertex_formats_widen_to_their_four_component_siblings() {
+        assert_eq!(widened_vertex_format(vk::Format::R8G8B8_UNORM), Some(vk::Format::R8G8B8A8_UNORM));
+        assert_eq!(
+            widened_vertex_format(vk::Format::R16G16B16_SFLOAT),
+            Some(vk::Format::R16G16B16A16_SFLOAT)
+        );
+        // Every 3-component 8/16-bit Metal vertex format has a sibling.
+        for metal in [2, 5, 8, 11, 14, 17, 20, 23, 26] {
+            let format = vertex_format(metal).unwrap();
+            assert!(widened_vertex_format(format).is_some(), "MTLVertexFormat {metal}");
+        }
+        assert_eq!(widened_vertex_format(vk::Format::R32G32B32_SFLOAT), None);
+    }
 
     #[test]
     fn metal_blend_state_maps_to_vulkan() {

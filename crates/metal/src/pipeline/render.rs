@@ -295,6 +295,30 @@ pub(crate) struct RenderPipeline {
     pub profile_label: Option<std::sync::Arc<str>>,
 }
 
+/// `format` as `gpu` can fetch it from a vertex buffer.
+///
+/// Many desktop drivers fetch no three-component 8- or 16-bit format (a
+/// `UChar3Normalized` normal, a `Half3` position), and a pipeline naming one
+/// fails to build. Such an attribute is fetched as its four-component sibling
+/// at the same offset instead: the same components, and one more that a shader
+/// declaring three never reads. A shader declaring four would read that byte
+/// where Metal supplies 1; that is the cost of drawing at all on such a
+/// driver. Any other format, fetchable or not, is left for the driver to judge.
+fn fetchable_vertex_format(gpu: &Gpu, format: vk::Format) -> vk::Format {
+    let fetches = |format: vk::Format| {
+        crate::vulkan::instance().is_none_or(|instance| {
+            // SAFETY: the physical device belongs to this live instance.
+            unsafe { instance.get_physical_device_format_properties(gpu.physical, format) }
+                .buffer_features
+                .contains(vk::FormatFeatureFlags::VERTEX_BUFFER)
+        })
+    };
+    match widened_vertex_format(format) {
+        Some(wider) if !fetches(format) && fetches(wider) => wider,
+        _ => format,
+    }
+}
+
 impl RenderPipeline {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -332,6 +356,7 @@ impl RenderPipeline {
             let format = vertex_format(attribute.format).ok_or_else(|| {
                 format!("MTLVertexFormat {} has no Vulkan form", attribute.format)
             })?;
+            let format = fetchable_vertex_format(gpu, format);
             // `-setBufferIndex:` takes any `NSUInteger`, and the layouts below
             // are the 31 a `MTLVertexDescriptor` has.
             if attribute.buffer_index as usize >= VERTEX_SLOTS {
