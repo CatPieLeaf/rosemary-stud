@@ -20,6 +20,7 @@ fn shared_texture_attachments_reuse_views_across_recording_threads() {
             array_length: 4,
             storage_mode: 2,
             usage: gpu::USAGE_RENDER_TARGET,
+            swizzle: Default::default(),
         },
     );
     assert!(!texture.is_null());

@@ -583,6 +583,7 @@ mod tests {
             array_length: 1,
             storage_mode: MTL_STORAGE_MODE_PRIVATE,
             usage: 0,
+            swizzle: super::texture::IDENTITY_SWIZZLE,
         }
     }
 

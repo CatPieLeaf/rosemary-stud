@@ -35,6 +35,7 @@ fn multisampled_depth_and_stencil_can_use_aliases_of_one_texture() {
                 array_length: 1,
                 storage_mode: MTL_STORAGE_MODE_PRIVATE,
                 usage,
+                swizzle: Default::default(),
             },
         )
     };

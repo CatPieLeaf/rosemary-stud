@@ -26,6 +26,7 @@ fn single_element_viewport_and_scissor_arrays_clip_the_rendered_pixels() {
                 array_length: 1,
                 storage_mode: 2,
                 usage: gpu::USAGE_RENDER_TARGET,
+                swizzle: Default::default(),
             },
         );
         let vertices = new_buffer(device, std::ptr::null(), 48, 0);
@@ -158,6 +159,7 @@ fn render_indexed_viewports(device: Id, encode: impl FnOnce(Id)) -> Vec<u8> {
                 array_length: 1,
                 storage_mode: 2,
                 usage: gpu::USAGE_RENDER_TARGET,
+                swizzle: Default::default(),
             },
         );
         let vertices = new_buffer(device, std::ptr::null(), 48, 0);

@@ -172,6 +172,11 @@ pub(crate) fn install() {
             c"Q16@0:8",
         );
     }
+    methods!(descriptor, {
+        "setSwizzle:" => texture::set_descriptor_swizzle,
+            c"v20@0:8{MTLTextureSwizzleChannels=CCCC}16";
+        "swizzle" => texture::descriptor_swizzle, c"{MTLTextureSwizzleChannels=CCCC}16@0:8";
+    });
     heap::install();
     common::install(buffer);
     common::install_buffer(buffer);

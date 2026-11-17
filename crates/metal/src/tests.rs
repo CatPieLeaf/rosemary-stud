@@ -970,6 +970,7 @@ fn a_texture_bound_again_in_one_command_buffer_is_the_one_read() {
                     array_length: 1,
                     storage_mode: 0,
                     usage: gpu::USAGE_SHADER_READ,
+                    swizzle: Default::default(),
                 },
             );
             replace_region(texture, [0, 0, 1, 1], &value.to_le_bytes(), 4);
@@ -1508,6 +1509,7 @@ fn check_render_target_gap(device: Id) {
                 array_length: 1,
                 storage_mode: 2,
                 usage: gpu::USAGE_RENDER_TARGET,
+                swizzle: Default::default(),
             },
         )
     };
@@ -1687,6 +1689,7 @@ fn check_depth_resolve(device: Id) {
                 array_length: 1,
                 storage_mode: 2,
                 usage: gpu::USAGE_RENDER_TARGET,
+                swizzle: Default::default(),
             },
         )
     };
@@ -2139,6 +2142,7 @@ fn a_translated_triangle_draws_on_the_gpu() {
             array_length: 1,
             storage_mode: 2,
             usage: gpu::USAGE_RENDER_TARGET,
+            swizzle: Default::default(),
         },
     );
     assert!(!target.is_null());
@@ -2225,6 +2229,7 @@ fn replaced_texels_reach_the_next_command_buffer() {
         array_length: 1,
         storage_mode: 0,
         usage: gpu::USAGE_SHADER_READ,
+        swizzle: Default::default(),
     };
     let texture = resource::new_texture(gpu, descriptor);
     assert!(!texture.is_null());
@@ -2290,6 +2295,7 @@ fn get_bytes_reads_back_replaced_texels() {
             array_length: 1,
             storage_mode: 0,
             usage: gpu::USAGE_SHADER_READ,
+            swizzle: Default::default(),
         },
     );
     assert!(!texture.is_null());
@@ -2386,6 +2392,7 @@ fn a_later_copy_over_the_same_texels_lands_after_an_earlier_one() {
                 array_length: 1,
                 storage_mode: 0,
                 usage: gpu::USAGE_SHADER_READ,
+                swizzle: Default::default(),
             },
         )
     };
@@ -2451,6 +2458,7 @@ fn streaming_upload_cost() {
                         array_length: 1,
                         storage_mode: 0,
                         usage: gpu::USAGE_SHADER_READ,
+                        swizzle: Default::default(),
                     },
                 )
             })
@@ -2515,6 +2523,7 @@ fn a_texture_released_before_its_upload_runs_outlives_it() {
             array_length: 1,
             storage_mode: 0,
             usage: gpu::USAGE_SHADER_READ,
+            swizzle: Default::default(),
         },
     );
     assert!(!texture.is_null());
@@ -2814,6 +2823,7 @@ fn recording_cost() {
                 array_length: 1,
                 storage_mode: 2,
                 usage: gpu::USAGE_RENDER_TARGET,
+                swizzle: Default::default(),
             },
         );
         let pass = object::make(
@@ -2985,6 +2995,7 @@ fn recording_cost_with_resources() {
                     array_length: 1,
                     storage_mode: 2,
                     usage,
+                    swizzle: Default::default(),
                 },
             )
         };
@@ -3137,6 +3148,7 @@ fn encoder_barrier_device_cost() {
                     array_length: 1,
                     storage_mode: 2,
                     usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+                    swizzle: Default::default(),
                 },
             )
         };
@@ -3295,6 +3307,7 @@ fn a_pass_samples_what_the_pass_before_drew() {
                     array_length: 1,
                     storage_mode: 2,
                     usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+                    swizzle: Default::default(),
                 },
             )
         };
@@ -3459,6 +3472,7 @@ fragment float4 mark(float4 position [[position]], device uint* out [[buffer(0)]
                 array_length: 1,
                 storage_mode: 2,
                 usage: gpu::USAGE_RENDER_TARGET,
+                swizzle: Default::default(),
             },
         );
         let corners: [f32; 12] = [
@@ -3560,6 +3574,7 @@ impl SamplingDraw {
                 array_length: 1,
                 storage_mode: 2,
                 usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+                swizzle: Default::default(),
             },
         )
     }
@@ -4061,6 +4076,7 @@ fn covering_draw_with_formats(
             array_length: 1,
             storage_mode: 2,
             usage: gpu::USAGE_RENDER_TARGET,
+            swizzle: Default::default(),
         },
     );
     // SAFETY: the same calls the guest makes.
@@ -4169,6 +4185,7 @@ fn check_separate_depth_and_stencil_attachments(device: Id) {
                 array_length: 1,
                 storage_mode: MTL_STORAGE_MODE_PRIVATE,
                 usage: gpu::USAGE_RENDER_TARGET,
+                swizzle: Default::default(),
             },
         )
     };
@@ -4400,6 +4417,7 @@ fn repeated_depth_bias_preserves_changed_depth_tests() {
             array_length: 1,
             storage_mode: MTL_STORAGE_MODE_PRIVATE,
             usage: gpu::USAGE_RENDER_TARGET,
+            swizzle: Default::default(),
         },
     );
     assert!(!depth.is_null());
@@ -5103,6 +5121,7 @@ fn generating_mipmaps_ends_a_blit_encoder_with_one_barrier() {
             array_length: 1,
             storage_mode: 0,
             usage: gpu::USAGE_SHADER_READ,
+            swizzle: Default::default(),
         },
     );
     assert!(!texture.is_null());
@@ -5305,6 +5324,7 @@ fn readable_texture(device: Id, texture_type: u64, pixel_format: u64, size: [u64
             array_length: 1,
             storage_mode: 0,
             usage: gpu::USAGE_SHADER_READ,
+            swizzle: Default::default(),
         },
     );
     assert!(!texture.is_null());
@@ -5849,6 +5869,7 @@ fn a_new_texture_reads_zero_over_a_range_texels_were_written_to() {
                     array_length: 1,
                     storage_mode: 0,
                     usage: gpu::USAGE_SHADER_READ,
+                    swizzle: Default::default(),
                 },
             );
             assert!(!texture.is_null());

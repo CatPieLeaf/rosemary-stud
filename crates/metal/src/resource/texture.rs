@@ -73,6 +73,8 @@ pub(crate) struct TextureDescriptor {
     pub array_length: u64,
     pub storage_mode: u64,
     pub usage: u64,
+    /// `-setSwizzle:`: each channel a shader reads, over the format's own.
+    pub swizzle: SwizzleChannels,
 }
 
 impl TextureDescriptor {
@@ -89,6 +91,7 @@ impl TextureDescriptor {
             array_length: 1,
             storage_mode: MTL_STORAGE_MODE_MANAGED,
             usage: gpu::USAGE_SHADER_READ,
+            swizzle: IDENTITY_SWIZZLE,
         }
     }
 
@@ -217,6 +220,7 @@ pub(crate) fn new_internal_attachment(
                 array_length: 1,
                 storage_mode: MTL_STORAGE_MODE_PRIVATE,
                 usage: gpu::USAGE_RENDER_TARGET,
+                swizzle: IDENTITY_SWIZZLE,
                 ..TextureDescriptor::default()
             },
             image,
@@ -297,8 +301,24 @@ pub(crate) fn image_description(descriptor: &TextureDescriptor) -> Option<ImageD
         samples: descriptor.sample_count,
         usage: descriptor.usage,
         cube,
-        components: gpu::pixel_format_components(descriptor.pixel_format),
+        // The descriptor's swizzle over the format's own mapping, as a view
+        // made with one composes it; a value Metal does not define leaves the
+        // format's mapping alone.
+        components: compose_swizzle(gpu::pixel_format_components(descriptor.pixel_format), descriptor.swizzle)
+            .unwrap_or_else(|| gpu::pixel_format_components(descriptor.pixel_format)),
     })
+}
+
+/// `-[MTLTextureDescriptor setSwizzle:]`.
+pub(super) unsafe extern "C" fn set_descriptor_swizzle(receiver: Id, _sel: Sel, swizzle: SwizzleChannels) {
+    // SAFETY: a texture descriptor of this crate's.
+    unsafe { object::body::<TextureDescriptor>(receiver) }.swizzle = swizzle;
+}
+
+/// `-[MTLTextureDescriptor swizzle]`.
+pub(super) unsafe extern "C" fn descriptor_swizzle(receiver: Id, _sel: Sel) -> SwizzleChannels {
+    // SAFETY: a texture descriptor of this crate's.
+    unsafe { object::body::<TextureDescriptor>(receiver) }.swizzle
 }
 
 /// Wrap an existing image as a Metal texture, for presentation, whose images
@@ -315,6 +335,7 @@ pub(crate) fn drawable_texture(gpu: &'static Gpu, image: GpuImage, pixel_format:
         array_length: 1,
         storage_mode: 2,
         usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+        swizzle: IDENTITY_SWIZZLE,
     };
     object::make(
         c"RosemaryMTLTexture",
@@ -908,8 +929,8 @@ pub(super) unsafe extern "C" fn new_texture_view_range(
 
 /// `MTLTextureSwizzleChannels`: each output channel's `MTLTextureSwizzle`.
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub(super) struct SwizzleChannels {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SwizzleChannels {
     red: u8,
     green: u8,
     blue: u8,
@@ -923,7 +944,14 @@ const MTL_TEXTURE_SWIZZLE_GREEN: u8 = 3;
 const MTL_TEXTURE_SWIZZLE_BLUE: u8 = 4;
 const MTL_TEXTURE_SWIZZLE_ALPHA: u8 = 5;
 
-const IDENTITY_SWIZZLE: SwizzleChannels = SwizzleChannels {
+/// The identity, not zeros: a derived default would read every channel as 0.
+impl Default for SwizzleChannels {
+    fn default() -> Self {
+        IDENTITY_SWIZZLE
+    }
+}
+
+pub(crate) const IDENTITY_SWIZZLE: SwizzleChannels = SwizzleChannels {
     red: MTL_TEXTURE_SWIZZLE_RED,
     green: MTL_TEXTURE_SWIZZLE_GREEN,
     blue: MTL_TEXTURE_SWIZZLE_BLUE,
@@ -1172,4 +1200,33 @@ pub(super) unsafe extern "C" fn buffer_new_texture(
             buffer: objc::arc::retain(receiver),
         },
     )
+}
+
+#[cfg(test)]
+mod descriptor_swizzle_tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_descriptor_reads_every_channel_as_itself() {
+        assert_eq!(TextureDescriptor::fresh().swizzle, IDENTITY_SWIZZLE);
+        assert_eq!(SwizzleChannels::default(), IDENTITY_SWIZZLE);
+    }
+
+    #[test]
+    fn a_descriptor_swizzle_composes_over_the_format_mapping() {
+        use vk::ComponentSwizzle as S;
+        // `A8Unorm` keeps its one channel in red and reads it as alpha; a
+        // swizzle that shows alpha in every channel then shows that red.
+        let all_alpha = SwizzleChannels {
+            red: MTL_TEXTURE_SWIZZLE_ALPHA,
+            green: MTL_TEXTURE_SWIZZLE_ALPHA,
+            blue: MTL_TEXTURE_SWIZZLE_ALPHA,
+            alpha: MTL_TEXTURE_SWIZZLE_ONE,
+        };
+        let composed = compose_swizzle(gpu::pixel_format_components(1), all_alpha).unwrap();
+        assert_eq!([composed.r, composed.g, composed.b, composed.a], [S::R, S::R, S::R, S::ONE]);
+        // An undefined channel value is refused rather than guessed.
+        let bad = SwizzleChannels { red: 9, ..IDENTITY_SWIZZLE };
+        assert!(compose_swizzle(vk::ComponentMapping::default(), bad).is_none());
+    }
 }
