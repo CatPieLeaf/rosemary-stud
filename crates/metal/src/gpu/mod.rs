@@ -198,6 +198,8 @@ pub struct Gpu {
     pub(crate) occlusion_precise: bool,
     /// Whether a pipeline can force coverage-written alpha to one.
     pub(crate) alpha_to_one: bool,
+    /// Whether the device samples BC1-BC7 textures (`textureCompressionBC`).
+    pub(crate) texture_compression_bc: bool,
     /// Whether culling, winding, depth and stencil state and the topology
     /// within its class are set per draw, as Vulkan 1.3 can, rather than
     /// compiled into one pipeline per combination.
@@ -1012,6 +1014,7 @@ impl Gpu {
             occlusion_pools: Mutex::new(Vec::new()),
             occlusion_precise: features.occlusion_query_precise == vk::TRUE,
             alpha_to_one: features.alpha_to_one == vk::TRUE,
+            texture_compression_bc: features.texture_compression_bc == vk::TRUE,
             max_viewports: if features.multi_viewport == vk::TRUE {
                 properties.limits.max_viewports
             } else {

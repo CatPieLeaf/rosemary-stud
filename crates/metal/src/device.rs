@@ -281,9 +281,10 @@ pub(super) unsafe extern "C" fn yes(_receiver: Id, _sel: Sel) -> bool {
 }
 
 /// `-supportsBCTextureCompression`, which the pixel-format table needs in
-/// order to answer a BC format at all.
+/// order to answer a BC format at all: only where the device samples them,
+/// so a game picks another format instead of uploading textures that fail.
 pub(super) unsafe extern "C" fn supports_bc(receiver: Id, _sel: Sel) -> bool {
-    gpu_of(receiver).is_some()
+    gpu_of(receiver).is_some_and(|gpu| gpu.texture_compression_bc)
 }
 
 /// `-argumentBuffersSupport`: `MTLArgumentBuffersTier1`, which is the tier
