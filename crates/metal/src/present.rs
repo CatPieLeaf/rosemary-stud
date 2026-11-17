@@ -1127,7 +1127,7 @@ pub(crate) fn enqueue_swapchain(drawable: Id) -> PresentAttempt {
     // SAFETY: a drawable of this crate's, checked above.
     let described = unsafe { object::body::<Drawable>(drawable) };
     // SAFETY: a drawable's texture is this crate's.
-    let texture = unsafe { object::body::<Texture>(described.texture) };
+    let texture = unsafe { object::body_ref::<Texture>(described.texture) };
     // SAFETY: a `CAMetalLayer` this runtime made.
     let view = unsafe { appkit::layer::view_of(described.layer) };
     if appkit::view::is_hidden_or_has_hidden_ancestor(view) {
@@ -1319,7 +1319,7 @@ fn present_inner(drawable: Id) {
     // SAFETY: a drawable of this crate's, checked above.
     let described = unsafe { object::body::<Drawable>(drawable) };
     // SAFETY: a drawable's texture is this crate's.
-    let texture = unsafe { object::body::<Texture>(described.texture) };
+    let texture = unsafe { object::body_ref::<Texture>(described.texture) };
     let gpu = described.gpu;
     // SAFETY: a `CAMetalLayer` this runtime made.
     let view = unsafe { appkit::layer::view_of(described.layer) };
@@ -1599,7 +1599,7 @@ fn window_size() -> Option<(u32, u32)> {
 // The layer is AppKit's object, so its properties are read by message rather
 // than by reaching into a layout this crate does not own.
 
-fn send_id(receiver: Id, selector: &str) -> Id {
+pub(crate) fn send_id(receiver: Id, selector: &str) -> Id {
     let sel = objc::sel::get(selector);
     // SAFETY: null or an object the runtime allocated.
     let Some(method) = unsafe { objc::object::class_of(receiver) }.and_then(|c| c.method(sel))
@@ -1612,7 +1612,7 @@ fn send_id(receiver: Id, selector: &str) -> Id {
     unsafe { call(receiver, sel) }
 }
 
-fn send_u64(receiver: Id, selector: &str) -> u64 {
+pub(crate) fn send_u64(receiver: Id, selector: &str) -> u64 {
     let sel = objc::sel::get(selector);
     // SAFETY: null or an object the runtime allocated.
     let Some(method) = unsafe { objc::object::class_of(receiver) }.and_then(|c| c.method(sel))
@@ -1625,7 +1625,22 @@ fn send_u64(receiver: Id, selector: &str) -> u64 {
     unsafe { call(receiver, sel) }
 }
 
-fn send_size(receiver: Id, selector: &str) -> (f64, f64) {
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn send_bool(receiver: Id, selector: &str) -> bool {
+    let sel = objc::sel::get(selector);
+    // SAFETY: null or an object the runtime allocated.
+    let Some(method) = unsafe { objc::object::class_of(receiver) }.and_then(|c| c.method(sel))
+    else {
+        return false;
+    };
+    // SAFETY: a `BOOL (id, SEL)` accessor. A BOOL is a signed char that may
+    // hold any nonzero value, which a Rust `bool` must not.
+    let call: unsafe extern "C" fn(Id, Sel) -> i8 =
+        unsafe { std::mem::transmute(method.implementation()) };
+    unsafe { call(receiver, sel) != 0 }
+}
+
+pub(crate) fn send_size(receiver: Id, selector: &str) -> (f64, f64) {
     let sel = objc::sel::get(selector);
     // SAFETY: null or an object the runtime allocated.
     let Some(method) = unsafe { objc::object::class_of(receiver) }.and_then(|c| c.method(sel))

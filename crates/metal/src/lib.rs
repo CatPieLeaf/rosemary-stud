@@ -12,6 +12,8 @@ mod gpu;
 mod hash;
 mod heap;
 mod library;
+#[cfg(target_os = "macos")]
+mod native;
 mod object;
 mod overlay;
 mod pipeline;
@@ -53,13 +55,18 @@ struct Device {
     gpu: Option<&'static Gpu>,
 }
 
+enum LibraryInput {
+    Air {
+        modules: Vec<Vec<u8>>,
+        entry_modules: Vec<usize>,
+    },
+    Msl(metal_translate::MslSource),
+}
+
 struct Library {
     translated: metal_translate::TranslatedLibrary,
-    /// The AIR modules the library was made from, kept only where one declares
-    /// function constants: each set of values translates its owning module.
-    air: Option<Vec<Vec<u8>>>,
-    /// Owning AIR module for each translated entry point.
-    entry_modules: Vec<usize>,
+    /// Retained only when function constants can require another translation.
+    input: Option<LibraryInput>,
     /// The profile of the device which made the library.
     target: Option<&'static metal_translate::TargetProfile>,
     /// The device which made the library. Devices live as long as the
@@ -69,7 +76,11 @@ struct Library {
 
 struct Function {
     library: Id,
-    entry: usize,
+    name: String,
+    stage: metal_translate::ir::Stage,
+    base_entry: Option<usize>,
+    /// Only the library constants this entry point uses.
+    constants: Vec<metal_translate::FunctionConstantInfo>,
     /// The entry point translated for the function constants this function
     /// was made with, in place of the library's own.
     specialized: Option<metal_translate::EntryArtifact>,
@@ -89,7 +100,8 @@ impl Function {
             return Some(unsafe { &*(artifact as *const metal_translate::EntryArtifact) });
         }
         let library = unsafe { object::body::<Library>(self.library) };
-        library.translated.entries.get(self.entry)
+        self.base_entry
+            .and_then(|entry| library.translated.entries.get(entry))
     }
 }
 
@@ -350,7 +362,12 @@ fn install_labels() {
         c"RosemaryMTLTexture",
         c"RosemaryMTLVertexElement",
     ];
-    for name in names {
+    add_labels(&names);
+}
+
+/// Give each named class, where it exists, the no-op `-label`/`-setLabel:`.
+pub(crate) fn add_labels(names: &[&std::ffi::CStr]) {
+    for &name in names {
         let Some(class) = objc::class::lookup(name) else {
             continue;
         };

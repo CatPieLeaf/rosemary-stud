@@ -58,6 +58,7 @@ pub struct TargetProfile {
     pub sample_rate_shading: bool,
     pub geometry_shader: bool,
     pub multi_viewport: bool,
+    pub shader_output_viewport_index: bool,
     pub demote_to_helper_invocation: bool,
     /// Vulkan 1.1 subgroup operations support `GroupNonUniform` when the
     /// physical device reports the basic operation for the shader stage.
@@ -71,6 +72,9 @@ pub struct TargetProfile {
     /// `variablePointers`, which widens the above to `Workgroup` memory - a
     /// pointer into a Metal `threadgroup` array.
     pub variable_pointers: bool,
+    /// The driver compiles SPIR-V to Metal Shading Language (MoltenVK), so
+    /// GLSL's `FMix` becomes Metal's own `mix`.
+    pub fmix_is_metal_mix: bool,
 }
 
 impl TargetProfile {
@@ -101,12 +105,14 @@ impl TargetProfile {
             sample_rate_shading: false,
             geometry_shader: false,
             multi_viewport: false,
+            shader_output_viewport_index: false,
             demote_to_helper_invocation: false,
             group_non_uniform: false,
             image_1d: true,
             image_query: true,
             variable_pointers_storage_buffer: false,
             variable_pointers: false,
+            fmix_is_metal_mix: false,
         }
     }
 
@@ -134,6 +140,10 @@ impl TargetProfile {
             "SampleRateShading" => self.sample_rate_shading,
             "Geometry" => self.geometry_shader,
             "MultiViewport" => self.multi_viewport,
+            "ShaderViewportIndex" => self.shader_output_viewport_index,
+            "ShaderViewportIndexLayerEXT" => {
+                self.shader_output_viewport_index && self.vulkan_version < (1, 2)
+            }
             "DemoteToHelperInvocation" => self.demote_to_helper_invocation,
             "GroupNonUniform" => self.group_non_uniform,
             "Image1D" => self.image_1d,
@@ -154,6 +164,9 @@ impl TargetProfile {
                 self.variable_pointers_storage_buffer || self.variable_pointers
             }
             "SPV_EXT_demote_to_helper_invocation" => self.demote_to_helper_invocation,
+            "SPV_EXT_shader_viewport_index_layer" => {
+                self.shader_output_viewport_index && self.vulkan_version < (1, 2)
+            }
             "SPV_KHR_8bit_storage" => {
                 self.storage_buffer8_bit_access
                     || self.uniform_and_storage_buffer8_bit_access
@@ -249,6 +262,8 @@ pub struct TranslatedLibrary {
     /// any has to be translated again for each set of values a function is
     /// made with.
     pub function_constants: Vec<FunctionConstantInfo>,
+    /// Entry names and their constant uses before specialization and folding.
+    pub function_reflection: Vec<FunctionReflection>,
     /// Entry points the source declares which could not be translated, and
     /// why: the rest of the library is usable, and asking for one of these
     /// reports its reason.
@@ -268,6 +283,15 @@ pub struct FunctionConstantInfo {
     pub name: String,
     /// The Itanium spelling of its Metal type.
     pub encoding: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionReflection {
+    pub name: String,
+    pub stage: Stage,
+    pub constants: Vec<FunctionConstantInfo>,
+    /// The emitted entry index, or `None` for a source template without code.
+    pub entry: Option<usize>,
 }
 
 pub fn emit_spirv(
@@ -324,6 +348,7 @@ pub fn emit_spirv(
     Ok(TranslatedLibrary {
         entries,
         function_constants,
+        function_reflection: Vec::new(),
         rejected,
     })
 }
@@ -398,6 +423,7 @@ fn emit_entry(
     }
     hoist_phis(&mut function);
     reverse_post_order(&mut function);
+    function.verify()?;
     let function = &function;
     let mut emitter = Emitter::new(target);
     emitter.declare_globals(module, function)?;

@@ -455,6 +455,19 @@ impl Emitter {
                 values,
                 |builder, ty, id, a, b| builder.dot(ty, id, a, b),
             )?,
+            InstructionKind::FloatRefract {
+                incident,
+                normal,
+                ratio,
+            } => {
+                self.emit_ext_inst(
+                    function,
+                    instruction,
+                    values,
+                    GlslStd450Op::Refract,
+                    [incident, normal, ratio],
+                )?;
+            }
             InstructionKind::FloatClamp { value, min, max } => {
                 self.emit_ext_inst(
                     function,
@@ -462,6 +475,21 @@ impl Emitter {
                     values,
                     GlslStd450Op::FClamp,
                     [value, min, max],
+                )?;
+            }
+            InstructionKind::FloatMix {
+                first,
+                second,
+                weight,
+            } if self.target.fmix_is_metal_mix => {
+                // The rewrite below would cost MoltenVK an unoptimized helper
+                // call per NoContraction operation.
+                self.emit_ext_inst(
+                    function,
+                    instruction,
+                    values,
+                    GlslStd450Op::FMix,
+                    [first, second, weight],
                 )?;
             }
             InstructionKind::FloatMix {
