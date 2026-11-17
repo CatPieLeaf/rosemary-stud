@@ -170,6 +170,17 @@ fn initialize() -> Result<State, String> {
             let device_extensions =
                 unsafe { instance.enumerate_device_extension_properties(handle) }
                     .unwrap_or_default();
+            let supports_memory_budget =
+                has_extension(&device_extensions, ash::ext::memory_budget::NAME);
+            let budget = supports_memory_budget.then(|| {
+                let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+                let mut properties =
+                    vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+                // SAFETY: the physical device belongs to this live instance,
+                // and both structures live across the call.
+                unsafe { instance.get_physical_device_memory_properties2(handle, &mut properties) };
+                budget
+            });
             let name = properties.device_name_as_c_str().map_or_else(
                 |_| "Vulkan Device".to_string(),
                 |name| name.to_string_lossy().into_owned(),
@@ -194,7 +205,7 @@ fn initialize() -> Result<State, String> {
                 Adapter {
                     handle: handle.as_raw() as usize,
                     name,
-                    recommended_working_set: recommended_working_set(&memory),
+                    recommended_working_set: recommended_working_set(&memory, budget.as_ref()),
                     target,
                     gpu: OnceLock::new(),
                 },
@@ -254,19 +265,25 @@ fn adapter_rank(
     }
 }
 
-/// `recommendedMaxWorkingSetSize`: the device-local memory the GPU has.
-///
-/// A Mac's discrete GPU answers about its whole memory, a fixed figure. The
-/// Vulkan memory budget is instead what is free at this moment, after the
-/// desktop and every other program took theirs - a 4 GiB card answered
-/// 2.6 GiB, which a game read as a 2 GiB card and sized its textures and
-/// streaming for, and which moved with whatever else was open.
-fn recommended_working_set(memory: &vk::PhysicalDeviceMemoryProperties) -> u64 {
-    memory.memory_heaps[..memory.memory_heap_count as usize]
+fn recommended_working_set(
+    memory: &vk::PhysicalDeviceMemoryProperties,
+    budget: Option<&vk::PhysicalDeviceMemoryBudgetPropertiesEXT<'_>>,
+) -> u64 {
+    let heaps = &memory.memory_heaps[..memory.memory_heap_count as usize];
+    let capacity = heaps
         .iter()
         .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
         .map(|heap| heap.size)
-        .sum()
+        .sum();
+    let budget = budget.map_or(0, |budget| {
+        heaps
+            .iter()
+            .enumerate()
+            .filter(|(_, heap)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|(index, _)| budget.heap_budget[index])
+            .sum()
+    });
+    if budget == 0 { capacity } else { budget }
 }
 
 /// Surface extensions and portability enumeration advertised by the loader.
@@ -685,10 +702,25 @@ mod tests {
     }
 
     #[test]
-    fn working_set_is_the_device_local_capacity() {
+    fn working_set_uses_the_device_local_budget() {
+        let memory = memory(8 * 1024 * 1024 * 1024);
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        budget.heap_budget[0] = 6 * 1024 * 1024 * 1024;
+
+        assert_eq!(
+            recommended_working_set(&memory, Some(&budget)),
+            6 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn working_set_falls_back_to_device_local_capacity() {
         let memory = memory(8 * 1024 * 1024 * 1024);
 
-        assert_eq!(recommended_working_set(&memory), 8 * 1024 * 1024 * 1024);
+        assert_eq!(
+            recommended_working_set(&memory, None),
+            8 * 1024 * 1024 * 1024
+        );
     }
 
     fn properties(
