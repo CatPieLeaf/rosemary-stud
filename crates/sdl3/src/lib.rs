@@ -2272,12 +2272,21 @@ pub mod video {
                 event_type::MOUSE_MOTION => {
                     let e: MouseMotionEvent = decode(&raw);
                     let s = video::x11_scale();
+                    // In relative mode the deltas are the device's own counts,
+                    // as on Wayland, not X11 pixels: dividing them by the
+                    // desktop scale slowed mouse look by that much.
+                    let r = match s != 1.0
+                        && video::relative_mouse_mode(video::window_from_id(e.window))
+                    {
+                        true => 1.0,
+                        false => s,
+                    };
                     Event::MouseMotion {
                         window: e.window,
                         x: e.x / s,
                         y: e.y / s,
-                        dx: e.xrel / s,
-                        dy: e.yrel / s,
+                        dx: e.xrel / r,
+                        dy: e.yrel / r,
                         buttons: e.state,
                     }
                 }
