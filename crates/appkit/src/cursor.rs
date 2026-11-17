@@ -176,18 +176,16 @@ fn show(cursor: Id) {
 struct Drawn {
     popup: usize,
     parent: usize,
-    cursor: usize,
-    at: (i32, i32),
-    /// The popup's size in points while shown.
+    /// The parent's size in points, which the popup covers.
     size: (i32, i32),
-    /// The popup's RGBA pixels at its own size, their width appended.
+    /// The cursor shown and where its image's top left is, in the parent's
+    /// points; `None` while nothing is shown.
+    shown: Option<(usize, (i32, i32))>,
+    /// The shown cursor's RGBA pixels, their width appended.
     pixels: Vec<u8>,
     /// Paints still to make: the first can land before the window is mapped
     /// and be lost, so the next few refreshes paint again.
     repaints: u8,
-    /// Cleared and shrunk rather than unmapped or destroyed: a compositor
-    /// fades a window out as it goes, which left a ghost of the cursor.
-    hidden: bool,
 }
 
 static DRAWN: std::sync::Mutex<Option<Drawn>> = std::sync::Mutex::new(None);
@@ -211,6 +209,11 @@ fn drawable_cursor() -> Option<Id> {
 
 /// Show, move or take away the drawn cursor to match the guest's state now.
 /// Main thread only, which is where SDL's windows live.
+///
+/// The popup covers its window and never moves: the cursor moves by being
+/// painted somewhere else. An X11 window's move lands when SDL gets to it, and
+/// making SDL apply it at once has it process events in the middle of the
+/// guest's warp; a paint is shown as soon as it is presented.
 pub(crate) fn refresh_drawn() {
     if !sdl3::video::is_video_thread() {
         return;
@@ -225,64 +228,56 @@ pub(crate) fn refresh_drawn() {
     if parent_gone && let Some(old) = drawn.take() {
         sdl3::video::destroy_window(old.popup as sdl3::Window);
     }
-    match (drawn.as_mut(), target) {
-        (Some(current), Some((_, cursor, at))) => {
-            let popup = current.popup as sdl3::Window;
-            if current.cursor != cursor as usize
-                && let Some((size, pixels)) = render(cursor)
-            {
-                current.cursor = cursor as usize;
-                current.size = size;
-                current.pixels = pixels;
-                current.repaints = 3;
-                if !current.hidden {
-                    sdl3::video::set_window_size(popup, size.0, size.1);
-                }
-            }
-            if current.hidden {
-                current.hidden = false;
-                current.repaints = 3;
-                sdl3::video::set_window_size(popup, current.size.0, current.size.1);
-                sdl3::video::set_window_position(popup, at.0, at.1);
-                current.at = at;
-            }
-            if current.at != at {
-                sdl3::video::set_window_position(popup, at.0, at.1);
-                current.at = at;
-            }
-            if current.repaints > 0 {
-                current.repaints -= 1;
-                paint(popup, &current.pixels);
-            }
-        }
-        (Some(current), None) => {
-            if !current.hidden {
-                current.hidden = true;
-                let popup = current.popup as sdl3::Window;
-                paint(popup, &[0, 0, 0, 0, 1, 0, 0, 0]);
-                sdl3::video::set_window_size(popup, 1, 1);
-            }
-        }
-        (None, Some((parent, cursor, at))) => {
-            if let Some((popup, size, pixels)) = draw(parent, cursor, at) {
-                *drawn = Some(Drawn {
-                    popup: popup as usize,
-                    parent: parent as usize,
-                    cursor: cursor as usize,
-                    at,
-                    size,
-                    pixels,
-                    repaints: 3,
-                    hidden: false,
-                });
+    if drawn.is_none() {
+        let Some((parent, ..)) = target else {
+            return;
+        };
+        let Some(popup) = cover(parent) else {
+            return;
+        };
+        *drawn = Some(Drawn {
+            popup: popup as usize,
+            parent: parent as usize,
+            size: sdl3::video::window_size(parent).unwrap_or((1, 1)),
+            shown: None,
+            pixels: Vec::new(),
+            repaints: 0,
+        });
+    }
+    let Some(current) = drawn.as_mut() else {
+        return;
+    };
+    let popup = current.popup as sdl3::Window;
+    // The parent was resized: cover it again.
+    if let Some(size) = sdl3::video::window_size(current.parent as sdl3::Window)
+        && size != current.size
+    {
+        sdl3::video::set_window_size(popup, size.0, size.1);
+        current.size = size;
+        current.repaints = 3;
+    }
+    let wanted = target.map(|(_, cursor, at)| (cursor as usize, at));
+    if wanted != current.shown {
+        if let Some((cursor, _)) = wanted
+            && current.shown.is_none_or(|(old, _)| old != cursor)
+        {
+            match render(cursor as Id) {
+                Some((_, pixels)) => current.pixels = pixels,
+                None => current.pixels.clear(),
             }
         }
-        (None, None) => {}
+        current.shown = wanted;
+        current.repaints = 3;
+    }
+    if current.repaints > 0 {
+        current.repaints -= 1;
+        let at = current.shown.map(|(_, at)| at);
+        paint(popup, &current.pixels, at);
     }
 }
 
-/// The window, cursor and popup origin (in the window's points) to draw, or
-/// `None` when the hardware cursor is the one to see.
+/// The window, cursor and the cursor image's top left (in the window's
+/// points) to draw, or `None` when the hardware cursor is the one to see.
 fn drawn_target() -> Option<(sdl3::Window, Id, (i32, i32))> {
     if !sdl3::video::is_x11() || crate::screen::mouse_is_associated() || !wants_visible() {
         return None;
@@ -322,41 +317,39 @@ fn render(cursor: Id) -> Option<((i32, i32), Vec<u8>)> {
     Some((points, pixels))
 }
 
-/// Make the popup for `cursor` at `at`, painted, shown and closed to input.
+/// A transparent popup over all of `parent`, shown and closed to input, so
+/// clicks reach the window under it wherever the cursor is painted.
 ///
 /// Transparent: Xwayland's windows are composited by the Wayland compositor,
 /// which blends the image's own alpha.
-fn draw(
-    parent: sdl3::Window,
-    cursor: Id,
-    at: (i32, i32),
-) -> Option<(sdl3::Window, (i32, i32), Vec<u8>)> {
-    let (size, pixels) = render(cursor)?;
+fn cover(parent: sdl3::Window) -> Option<sdl3::Window> {
+    let (width, height) = sdl3::video::window_size(parent)?;
     let flags = sdl3::video::flags::TOOLTIP
         | sdl3::video::flags::NOT_FOCUSABLE
         | sdl3::video::flags::TRANSPARENT
         | sdl3::video::flags::HIDDEN;
-    let popup = sdl3::video::create_popup_window(parent, at.0, at.1, size.0, size.1, flags)?;
+    let popup = sdl3::video::create_popup_window(parent, 0, 0, width, height, flags)?;
+    // Before mapping: Xwayland takes the input region when it maps a window.
     sdl3::x11_mask::pass_input(popup);
+    // Clear before it is shown: a window's buffer is undefined until painted,
+    // and shown black for as long as it takes the first paint to land.
+    paint(popup, &[], None);
     sdl3::video::show_window(popup);
-    paint(popup, &pixels);
-    Some((popup, size, pixels))
+    paint(popup, &[], None);
+    Some(popup)
 }
 
-/// Paint RGBA `pixels` (their width appended) into the popup's surface, as
-/// premultiplied BGRA: the byte order of SDL's 32-bit X11 window surfaces,
-/// and the alpha a compositor blends.
-fn paint(popup: sdl3::Window, pixels: &[u8]) {
-    let Some(width) = pixels
+/// Paint the popup clear, with the cursor's RGBA `pixels` (their width
+/// appended) at `at` in the window's points when given: premultiplied BGRA,
+/// the byte order of SDL's 32-bit X11 window surfaces and the alpha a
+/// compositor blends.
+fn paint(popup: sdl3::Window, pixels: &[u8], at: Option<(i32, i32)>) {
+    let width = pixels
         .len()
         .checked_sub(4)
         .map(|n| u32::from_ne_bytes(pixels[n..].try_into().unwrap_or_default()) as usize)
-        .filter(|w| *w > 0)
-    else {
-        return;
-    };
-    let rgba = &pixels[..pixels.len() - 4];
-    let height = rgba.len() / 4 / width;
+        .filter(|w| *w > 0);
+    let scale = sdl3::video::x11_scale();
     sdl3::video::present_window(popup, |surface| {
         let (w, h) = (surface.width.max(0) as usize, surface.height.max(0) as usize);
         let length = surface.pitch as usize * h;
@@ -364,10 +357,25 @@ fn paint(popup: sdl3::Window, pixels: &[u8]) {
         // the surface is locked for the duration of this call.
         let out = unsafe { std::slice::from_raw_parts_mut(surface.pixels, length) };
         out.fill(0);
-        for y in 0..h.min(height) {
-            for x in 0..w.min(width) {
+        let (Some(width), Some(at)) = (width, at) else {
+            return true;
+        };
+        let rgba = &pixels[..pixels.len() - 4];
+        let height = rgba.len() / 4 / width;
+        let left = (at.0 as f32 * scale).round() as isize;
+        let top = (at.1 as f32 * scale).round() as isize;
+        for y in 0..height {
+            let row = top + y as isize;
+            if row < 0 || row as usize >= h {
+                continue;
+            }
+            for x in 0..width {
+                let column = left + x as isize;
+                if column < 0 || column as usize >= w {
+                    continue;
+                }
                 let from = (y * width + x) * 4;
-                let to = y * surface.pitch as usize + x * 4;
+                let to = row as usize * surface.pitch as usize + column as usize * 4;
                 let a = u32::from(rgba[from + 3]);
                 let premultiply = |c: u8| ((u32::from(c) * a + 127) / 255) as u8;
                 out[to] = premultiply(rgba[from + 2]);

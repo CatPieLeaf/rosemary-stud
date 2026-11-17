@@ -1446,6 +1446,17 @@ mod tests {
 /// `kCGErrorSuccess` is `0`.
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::NSPoint) -> i32 {
+    // SAFETY: as this function's own contract.
+    let status = unsafe { warp_mouse_cursor(point) };
+    // A warp moves the frozen point the drawn cursor sits at, whichever way it
+    // went: going first person disassociates and then warps to the centre.
+    // After the warp, not before: under Xwayland a pointer warped onto the
+    // drawn cursor's window would leave the game's window, and its lock.
+    crate::cursor::refresh_drawn();
+    status
+}
+
+unsafe fn warp_mouse_cursor(point: foundation::geometry::NSPoint) -> i32 {
     let asked = point;
     let point = (point.x as f32, point.y as f32);
     let windows = crate::window::sdl_windows();
@@ -1510,8 +1521,6 @@ pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::
             clear_relative_pointer_lock(*window);
         }
     }
-    // A warp moves the frozen point the drawn cursor sits at.
-    crate::cursor::refresh_drawn();
     let warped = repeated || warp_physical(target, point, local);
     for window in relative {
         // Also repairs a pointer that drifted from a repeated target.
@@ -1766,6 +1775,11 @@ pub(crate) fn replay_unfocused_warp() {
     if let Some((x, y)) = held {
         // SAFETY: a point, as the guest passed it.
         unsafe { CGWarpMouseCursorPosition(foundation::geometry::NSPoint { x, y }) };
+        // A warp's distance reaches the next motion's delta, which a game
+        // warping to its centre subtracts again. This one was asked before the
+        // window had the keyboard and is made only now, from wherever the
+        // click landed: the game is not expecting its distance.
+        crate::event::forget_warp_delta();
     }
 }
 
