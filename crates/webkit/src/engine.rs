@@ -20,6 +20,16 @@ pub struct Engine {
 
 static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 
+/// The compositor the pages are shown in: WebKitGTK's own, or with the web
+/// view host's helper (`STUD_WEBVIEW_HELPER`), the one its QtWebEngine windows
+/// live in. `None` where neither runs.
+pub fn compositor() -> Option<&'static Compositor> {
+    if crate::remote::requested() {
+        return crate::remote::compositor();
+    }
+    get().map(|engine| &engine.compositor)
+}
+
 /// The engine, started on first use; `None` where WebKitGTK is missing or
 /// cannot open a display, or on a thread other than the one it runs on.
 pub fn get() -> Option<&'static Engine> {
@@ -156,7 +166,7 @@ fn with_environment<T>(variables: &[(&str, &std::ffi::OsStr)], f: impl FnOnce() 
 }
 
 /// Get the main thread to the pump, from the compositor's thread.
-fn wake() {
+pub(crate) fn wake() {
     corefoundation::runloop::main().wake();
 }
 

@@ -9,7 +9,7 @@ use objc::class::Class;
 use objc::object::Id;
 use objc::sel::Sel;
 
-use crate::compositor::{Command, Event, Monitor};
+use crate::compositor::{Command, Compositor, Event, Monitor};
 use crate::engine::{self, Block, Engine, HostBlock};
 use crate::gtk::{self, Ptr};
 use crate::{clipboard, configuration, keys, remote, send};
@@ -1067,20 +1067,20 @@ fn make_window(engine: &Engine, gtk: Ptr, width: c_int, height: c_int) -> Option
 /// Give the page the keyboard, or take it away, as the AppKit view becomes
 /// or stops being first responder - the same event WebKit follows on macOS.
 fn set_focused(object: Id, focused: bool) {
-    let Some(engine) = engine::get() else {
+    let Some(compositor) = engine::compositor() else {
         return;
     };
     if let Some(surface) = with_object(object, |v| v.surface).filter(|s| *s != 0) {
-        focus(engine, surface, focused);
+        focus(compositor, surface, focused);
     }
 }
 
-fn focus(engine: &Engine, surface: u32, focused: bool) {
+fn focus(compositor: &Compositor, surface: u32, focused: bool) {
     thread_local! {
         static FOCUSED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     }
     if focused {
-        clipboard::offer(engine);
+        clipboard::offer(compositor);
         FOCUSED.set(Some(surface));
     } else if FOCUSED.get() == Some(surface) {
         FOCUSED.set(None);
@@ -1097,7 +1097,7 @@ fn focus(engine: &Engine, surface: u32, focused: bool) {
             }
         );
     }
-    engine.compositor.send(Command::Focus {
+    compositor.send(Command::Focus {
         surface: focused.then_some(surface),
     });
 }
@@ -1251,6 +1251,14 @@ fn forget(object: Id) {
         && let Some(remote) = remote::get()
     {
         remote.send(&["destroy", &view.id.to_string()]);
+        if view.surface != 0
+            && let Some(compositor) = remote::compositor()
+        {
+            focus(compositor, view.surface, false);
+            compositor.send(Command::Forget {
+                surface: view.surface,
+            });
+        }
     }
     if view.gtk != 0
         && let Some(engine) = engine::get()
@@ -1276,7 +1284,7 @@ fn forget(object: Id) {
         }
         engine::unref(api, view.gtk);
         if view.surface != 0 {
-            focus(engine, view.surface, false);
+            focus(&engine.compositor, view.surface, false);
             engine.compositor.send(Command::Forget {
                 surface: view.surface,
             });
@@ -1321,77 +1329,105 @@ pub fn tick(engine: &Engine) {
         if gtk.is_null() || surface == 0 {
             continue;
         }
-        let shown = !hidden && appkit::window::is_shown(window);
-        let configured = match &frame {
-            Some(frame) => {
-                let density = f64::from(sdl3::video::window_pixel_density(frame.window)).max(1.0);
-                Some(Configured {
-                    width: (f64::from(frame.width) / density).round().max(1.0) as c_int,
-                    height: (f64::from(frame.height) / density).round().max(1.0) as c_int,
-                    scale: density,
-                    suspended: !shown,
-                    monitor: monitor_of(frame.window),
-                    dmabuf: appkit::backing::shows_dmabufs_for_view(frame.window, object as usize),
-                })
-            }
-            // Off every window: keep the size, and stop drawing.
-            None => with_view(id, |v| v.configured.clone())
-                .flatten()
-                .map(|c| Configured {
-                    suspended: true,
-                    ..c
-                }),
-        };
-        if let Some(configured) = configured
-            && with_view(id, |v| {
-                let changed = v.configured.as_ref() != Some(&configured);
-                if changed {
-                    v.configured = Some(configured.clone());
-                }
-                changed
-            }) == Some(true)
-        {
-            engine.compositor.send(Command::Configure {
-                surface,
-                width: configured.width,
-                height: configured.height,
-                scale: configured.scale,
-                suspended: configured.suspended,
-                monitor: configured.monitor,
-                dmabuf: configured.dmabuf,
-            });
-        }
         if engine::tracing() {
             trace_page(engine, id, gtk);
         }
-        if !shown || frame.is_none() {
-            continue;
+        compose(&engine.compositor, id, object, surface, hidden, window, frame);
+    }
+    compositor_events(&engine.compositor);
+}
+
+/// Size `surface`'s window to its view, suspend it while hidden, and show
+/// the latest picture the compositor has of it.
+fn compose(
+    compositor: &Compositor,
+    id: usize,
+    object: Id,
+    surface: u32,
+    hidden: bool,
+    window: Id,
+    frame: Option<appkit::view::Frame>,
+) {
+    let shown = !hidden && appkit::window::is_shown(window);
+    let configured = match &frame {
+        Some(frame) => {
+            let density = f64::from(sdl3::video::window_pixel_density(frame.window)).max(1.0);
+            Some(Configured {
+                width: (f64::from(frame.width) / density).round().max(1.0) as c_int,
+                height: (f64::from(frame.height) / density).round().max(1.0) as c_int,
+                scale: density,
+                suspended: !shown,
+                monitor: monitor_of(frame.window),
+                dmabuf: appkit::backing::shows_dmabufs_for_view(frame.window, object as usize),
+            })
         }
-        if let Some(picture) = engine.compositor.take_frame(surface) {
-            if engine::tracing() {
-                let kind = match picture.picture {
-                    appkit::backing::Picture::Pixels(_) => "pixel",
-                    appkit::backing::Picture::Dmabuf(_) => "dma-buf",
-                };
-                eprintln!(
-                    "rosemary: webkit: view {id}: new {}x{} {kind} frame",
-                    picture.width, picture.height
-                );
+        // Off every window: keep the size, and stop drawing.
+        None => with_view(id, |v| v.configured.clone())
+            .flatten()
+            .map(|c| Configured {
+                suspended: true,
+                ..c
+            }),
+    };
+    if let Some(configured) = configured
+        && with_view(id, |v| {
+            let changed = v.configured.as_ref() != Some(&configured);
+            if changed {
+                v.configured = Some(configured.clone());
             }
-            appkit::backing::set_overlay(
-                object,
-                appkit::backing::Overlay {
-                    width: picture.width,
-                    height: picture.height,
-                    picture: picture.picture,
-                },
+            changed
+        }) == Some(true)
+    {
+        compositor.send(Command::Configure {
+            surface,
+            width: configured.width,
+            height: configured.height,
+            scale: configured.scale,
+            suspended: configured.suspended,
+            monitor: configured.monitor,
+            dmabuf: configured.dmabuf,
+        });
+    }
+    if !shown || frame.is_none() {
+        return;
+    }
+    if let Some(picture) = compositor.take_frame(surface) {
+        if engine::tracing() {
+            let kind = match picture.picture {
+                appkit::backing::Picture::Pixels(_) => "pixel",
+                appkit::backing::Picture::Dmabuf(_) => "dma-buf",
+            };
+            eprintln!(
+                "rosemary: webkit: view {id}: new {}x{} {kind} frame",
+                picture.width, picture.height
             );
         }
+        appkit::backing::set_overlay(
+            object,
+            appkit::backing::Overlay {
+                width: picture.width,
+                height: picture.height,
+                picture: picture.picture,
+            },
+        );
     }
-    for event in engine.compositor.take_events() {
+}
+
+/// What the compositor's windows asked for since the last look: a cursor, or
+/// the selection they copied.
+fn compositor_events(compositor: &Compositor) {
+    for event in compositor.take_events() {
         match event {
             Event::Cursor { surface, name } => set_cursor(surface, name),
             Event::Selection { entries } => clipboard::copied(entries),
+            Event::Named { surface, title } => {
+                let id = title
+                    .strip_prefix(crate::compositor::NAMED_PREFIX)
+                    .and_then(|id| id.parse::<usize>().ok());
+                if let Some(id) = id {
+                    with_view(id, |v| v.surface = surface);
+                }
+            }
         }
     }
 }
@@ -1916,17 +1952,17 @@ fn page_point(object: Id, event: Id) -> Option<(f64, f64)> {
 }
 
 /// The compositor, and the surface `receiver`'s page is on.
-fn surface_of(receiver: Id) -> Option<(&'static Engine, u32)> {
+fn surface_of(receiver: Id) -> Option<(&'static Compositor, u32)> {
     let surface = with_object(receiver, |v| v.surface).filter(|s| *s != 0)?;
-    Some((engine::get()?, surface))
+    Some((engine::compositor()?, surface))
 }
 
 /// Move the page's pointer to where `event` happened.
-fn pointer_to(receiver: Id, event: Id) -> Option<&'static Engine> {
-    let (engine, surface) = surface_of(receiver)?;
+fn pointer_to(receiver: Id, event: Id) -> Option<&'static Compositor> {
+    let (compositor, surface) = surface_of(receiver)?;
     let (x, y) = page_point(receiver, event)?;
-    engine.compositor.send(Command::Pointer { surface, x, y });
-    Some(engine)
+    compositor.send(Command::Pointer { surface, x, y });
+    Some(compositor)
 }
 
 /// `BTN_LEFT`, `BTN_RIGHT` and `BTN_MIDDLE`.
@@ -1951,8 +1987,8 @@ fn mouse(receiver: Id, event: Id, pressed: bool, button: usize) {
             page_point(receiver, event)
         );
     }
-    if let Some(engine) = pointer_to(receiver, event) {
-        engine.compositor.send(Command::Button {
+    if let Some(compositor) = pointer_to(receiver, event) {
+        compositor.send(Command::Button {
             button: BUTTONS[button],
             pressed,
         });
@@ -1988,7 +2024,7 @@ unsafe extern "C" fn mouse_moved(receiver: Id, _sel: Sel, event: Id) {
 }
 
 unsafe extern "C" fn scroll_wheel(receiver: Id, _sel: Sel, event: Id) {
-    let Some(engine) = pointer_to(receiver, event) else {
+    let Some(compositor) = pointer_to(receiver, event) else {
         return;
     };
     // SAFETY: an event; the deltas are `CGFloat (id, SEL)` and the precision
@@ -2017,28 +2053,28 @@ unsafe extern "C" fn scroll_wheel(receiver: Id, _sel: Sel, event: Id) {
             steps: Some(((-dx * 120.0).round() as i32, (-dy * 120.0).round() as i32)),
         },
     };
-    engine.compositor.send(command);
+    compositor.send(command);
 }
 
 /// Bring the keyboard's modifiers into line with the event's, so a key is
 /// read with what is held when it is pressed even if a `-flagsChanged:` went
 /// elsewhere.
-fn sync_modifiers(engine: &Engine, receiver: Id, event: Id) {
+fn sync_modifiers(compositor: &Compositor, receiver: Id, event: Id) {
     // SAFETY: an event; `-modifierFlags` is `NSUInteger (id, SEL)`.
     let flags = unsafe { send!(event, "modifierFlags"; u64) };
     let before = with_object(receiver, |v| {
         std::mem::replace(&mut v.modifier_flags, flags)
     });
     for (key, pressed) in keys::modifier_changes(before.unwrap_or_default(), flags) {
-        engine.compositor.send(Command::Key { key, pressed });
+        compositor.send(Command::Key { key, pressed });
     }
 }
 
 fn key(receiver: Id, event: Id, pressed: bool) {
-    let Some((engine, _)) = surface_of(receiver) else {
+    let Some((compositor, _)) = surface_of(receiver) else {
         return;
     };
-    sync_modifiers(engine, receiver, event);
+    sync_modifiers(compositor, receiver, event);
     // SAFETY: an event; both accessors are AppKit's own prototypes.
     let (code, repeat) = unsafe { (send!(event, "keyCode"; u16), send!(event, "isARepeat"; u8)) };
     // GTK repeats a held key itself, at the rate the compositor gives it.
@@ -2056,7 +2092,7 @@ fn key(receiver: Id, event: Id, pressed: bool) {
             & appkit::keymap::flags::COMMAND
             != 0
     {
-        clipboard::offer(engine);
+        clipboard::offer(compositor);
     }
     if engine::tracing() {
         eprintln!(
@@ -2064,7 +2100,7 @@ fn key(receiver: Id, event: Id, pressed: bool) {
             if pressed { "down" } else { "up" }
         );
     }
-    engine.compositor.send(Command::Key { key, pressed });
+    compositor.send(Command::Key { key, pressed });
 }
 
 unsafe extern "C" fn key_down(receiver: Id, _sel: Sel, event: Id) {
@@ -2103,8 +2139,8 @@ unsafe extern "C" fn perform_key_equivalent(receiver: Id, _sel: Sel, event: Id) 
 }
 
 unsafe extern "C" fn flags_changed(receiver: Id, _sel: Sel, event: Id) {
-    if let Some((engine, _)) = surface_of(receiver) {
-        sync_modifiers(engine, receiver, event);
+    if let Some((compositor, _)) = surface_of(receiver) {
+        sync_modifiers(compositor, receiver, event);
     }
 }
 
@@ -2131,8 +2167,8 @@ unsafe extern "C" fn cut(receiver: Id, _sel: Sel, _sender: Id) {
 }
 
 unsafe extern "C" fn paste(receiver: Id, _sel: Sel, _sender: Id) {
-    if let Some(engine) = engine::get() {
-        clipboard::offer(engine);
+    if let Some(compositor) = engine::compositor() {
+        clipboard::offer(compositor);
     }
     editing(receiver, c"Paste");
 }
@@ -2215,6 +2251,9 @@ pub(crate) fn remote_tick() {
     let Some(remote) = remote::get() else {
         return;
     };
+    // With the helper, pages are windows of a compositor of this process's own
+    // and drawn into the view, as WebKitGTK's are.
+    let compositor = remote::compositor();
     let views: Vec<(usize, usize)> = VIEWS.with(|views| {
         views
             .borrow()
@@ -2262,8 +2301,19 @@ pub(crate) fn remote_tick() {
             Some(None) => remote.send(&["hide", &id.to_string()]),
             None => {}
         }
+        if let Some(compositor) = compositor
+            && let Some(surface) = with_view(id, |v| v.surface).filter(|s| *s != 0)
+        {
+            // SAFETY: a live view, registered while it is.
+            let frame = unsafe { appkit::view::presentation_frame(object) };
+            compose(compositor, id, object, surface, hidden, window, frame);
+        }
+    }
+    if let Some(compositor) = compositor {
+        compositor_events(compositor);
     }
 }
+
 
 /// A navigation action for a page at `page` going to `url`.
 fn remote_action(url: &str, page: &str, kind: isize, main: bool, new_window: bool) -> Id {

@@ -7,7 +7,7 @@
 use std::cell::Cell;
 
 use crate::compositor::Command;
-use crate::engine::Engine;
+use crate::compositor::Compositor;
 
 /// The types GTK asks for text by, all answered with the same bytes.
 const TEXT_TYPES: &[&str] = &[
@@ -29,7 +29,7 @@ thread_local! {
 ///
 /// Called when a web view takes the keyboard and just before a paste, rather
 /// than on every turn, because reading the desktop's clipboard can be slow.
-pub fn offer(engine: &Engine) {
+pub fn offer(compositor: &Compositor) {
     let (count, text, html) = appkit::pasteboard::general_text_and_html();
     if SEEN.get() == Some(count) {
         return;
@@ -43,7 +43,7 @@ pub fn offer(engine: &Engine) {
         entries.push((HTML_TYPE.to_string(), html));
     }
     if !entries.is_empty() {
-        engine.compositor.send(Command::Offer { entries });
+        compositor.send(Command::Offer { entries });
     }
 }
 

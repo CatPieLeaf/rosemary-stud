@@ -32,6 +32,7 @@
 //! - `new_window view url`, `closed view`, `terminated view`
 //! - `cookies call json`, `cookie_done call`
 
+use crate::compositor::{Composition, Compositor};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,11 +45,22 @@ use crate::send;
 /// The variable naming the host's socket.
 pub const SOCKET: &str = "STUD_WEBVIEW_SOCKET";
 
+/// An executable to run as the host, with `--webview-helper`: its pages are
+/// windows of a compositor of this process's own, drawn into the guest's views
+/// as WebKitGTK's are, rather than windows of their own on the desktop. It is
+/// handed the protocol's socket as `STUD_WEBVIEW_FD` and the compositor as
+/// `WAYLAND_DISPLAY`.
+pub const HELPER: &str = "STUD_WEBVIEW_HELPER";
+
 /// Whether web views belong to the host: decided by the environment alone, so
 /// that WebKitGTK is never started beside it, even before the first view.
 pub fn requested() -> bool {
     static REQUESTED: OnceLock<bool> = OnceLock::new();
-    *REQUESTED.get_or_init(|| std::env::var_os(SOCKET).is_some_and(|value| !value.is_empty()))
+    *REQUESTED.get_or_init(|| {
+        [SOCKET, HELPER]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+    })
 }
 
 pub struct Remote {
@@ -56,6 +68,13 @@ pub struct Remote {
 }
 
 static REMOTE: OnceLock<Option<Remote>> = OnceLock::new();
+static COMPOSITOR: OnceLock<Compositor> = OnceLock::new();
+
+/// The compositor the helper's windows live in; `None` without the helper.
+pub fn compositor() -> Option<&'static Compositor> {
+    get()?;
+    COMPOSITOR.get()
+}
 static INBOX: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
 static NEXT_CALL: AtomicUsize = AtomicUsize::new(1);
 
@@ -68,12 +87,17 @@ pub fn get() -> Option<&'static Remote> {
 }
 
 fn connect() -> Option<Remote> {
-    let path = std::env::var_os(SOCKET)?;
-    let stream = match UnixStream::connect(&path) {
-        Ok(stream) => stream,
-        Err(error) => {
-            eprintln!("rosemary: webkit: the web view host did not answer: {error}");
-            return None;
+    let stream = match std::env::var_os(HELPER).filter(|value| !value.is_empty()) {
+        Some(helper) => start_helper(&helper)?,
+        None => {
+            let path = std::env::var_os(SOCKET)?;
+            match UnixStream::connect(&path) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    eprintln!("rosemary: webkit: the web view host did not answer: {error}");
+                    return None;
+                }
+            }
         }
     };
     let reader = stream.try_clone().ok()?;
@@ -85,6 +109,61 @@ fn connect() -> Option<Remote> {
     Some(Remote {
         writer: Mutex::new(stream),
     })
+}
+
+/// Start the compositor, and the helper in it, connected to this process by a
+/// socket pair; this end of it.
+fn start_helper(helper: &std::ffi::OsStr) -> Option<UnixStream> {
+    use std::os::fd::AsRawFd;
+    let composition = match std::env::var("ROSEMARY_WEBKIT_GPU").as_deref() {
+        Ok("0") => Composition::Cpu,
+        _ => Composition::Gpu(appkit::backing::importer()),
+    };
+    let compositor = match Compositor::start(crate::engine::wake, composition) {
+        Ok(compositor) => compositor,
+        Err(why) => {
+            eprintln!("rosemary: webkit: web views will have no content: {why}");
+            return None;
+        }
+    };
+    let (ours, theirs) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("rosemary: webkit: no socket for the web view helper: {error}");
+            return None;
+        }
+    };
+    let fd = theirs.as_raw_fd();
+    // SAFETY: a descriptor this process owns; only its close-on-exec flag
+    // changes, so the helper inherits it.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+    }
+    let started = std::process::Command::new(helper)
+        .arg("--webview-helper")
+        .env("STUD_WEBVIEW_FD", fd.to_string())
+        .env("WAYLAND_DISPLAY", &compositor.socket)
+        .env("QT_QPA_PLATFORM", "wayland")
+        .env_remove(HELPER)
+        .env_remove(SOCKET)
+        .spawn();
+    drop(theirs);
+    let mut child = match started {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("rosemary: webkit: the web view helper did not start: {error}");
+            return None;
+        }
+    };
+    // Reaped when it exits, which it does once this end closes.
+    let _ = std::thread::Builder::new()
+        .name("web view helper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    let _ = COMPOSITOR.set(compositor);
+    Some(ours)
 }
 
 impl Remote {

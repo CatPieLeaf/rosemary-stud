@@ -49,6 +49,11 @@ pub enum Composition {
 /// reads with `wl_proxy_get_id`: there is only one client.
 pub type SurfaceId = u32;
 
+#[cfg(target_os = "linux")]
+pub(crate) use state::NAMED_PREFIX;
+#[cfg(not(target_os = "linux"))]
+pub(crate) const NAMED_PREFIX: &str = "stud-view-";
+
 /// The host display a window is on, which its output stands for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Monitor {
@@ -107,6 +112,10 @@ pub enum Event {
     },
     /// GTK set the selection; these are its contents in the types asked for.
     Selection { entries: Vec<(String, Vec<u8>)> },
+    /// A toplevel took a title naming the view it is for: the web view host's
+    /// helper titles each of its windows `stud-view-<id>`, its only way to say
+    /// which surface is which view from another process.
+    Named { surface: SurfaceId, title: String },
 }
 
 /// What the compositor thread hands back.

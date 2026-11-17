@@ -106,6 +106,8 @@ struct Window {
     dirty: bool,
     created: Instant,
     closed: bool,
+    /// Whether its title has been reported as naming a view.
+    named: bool,
 }
 
 /// An output standing for one host display at one mode and scale. A display
@@ -1234,10 +1236,31 @@ impl CompositorHandler for State {
             && let Some(entry) = self.windows.get_mut(&window)
         {
             entry.dirty = true;
+            if !entry.named {
+                let title = with_states(entry.toplevel.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                        .and_then(|data| data.lock().ok()?.title.clone())
+                })
+                .unwrap_or_default();
+                if title.starts_with(NAMED_PREFIX) {
+                    entry.named = true;
+                    lock(&self.shared.events).push(Event::Named {
+                        surface: window,
+                        title,
+                    });
+                    (self.shared.wake)();
+                }
+            }
             self.arm_frames(window);
         }
     }
 }
+
+/// The title the web view host's helper gives each window: the prefix, then
+/// the view's id.
+pub(crate) const NAMED_PREFIX: &str = "stud-view-";
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -1262,6 +1285,7 @@ impl XdgShellHandler for State {
                 dirty: false,
                 created: Instant::now(),
                 closed: false,
+                named: false,
             },
         );
         self.place(window);
