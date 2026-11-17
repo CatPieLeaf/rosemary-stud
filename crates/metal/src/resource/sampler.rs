@@ -90,7 +90,10 @@ pub(crate) fn inline(gpu: &Gpu, sampler: &metal_translate::ir::InlineSampler) ->
 }
 
 fn create(gpu: &Gpu, descriptor: &SamplerDescriptor) -> Option<vk::Sampler> {
+    // `MTLSamplerAddressModeClampToZero` reads transparent black whatever
+    // border colour the descriptor also names; only ClampToBorderColor uses it.
     let border = match descriptor.border_color {
+        _ if descriptor.address.contains(&4) => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
         1 => vk::BorderColor::FLOAT_OPAQUE_BLACK,
         2 => vk::BorderColor::FLOAT_OPAQUE_WHITE,
         _ => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
@@ -116,7 +119,9 @@ fn create(gpu: &Gpu, descriptor: &SamplerDescriptor) -> Option<vk::Sampler> {
         false => (0.0, 0.0),
         // Metal's "not mipmapped" samples level zero whatever the texture
         // has; Vulkan spells that as a zero LOD clamp.
-        true if descriptor.mip_filter == 0 => (descriptor.lod_min_clamp, 0.25),
+        // Not mipmapped: level 0 only, and Metal ignores the LOD clamps, so
+        // a minimum above 0.25 must not pass on as min_lod > max_lod.
+        true if descriptor.mip_filter == 0 => (0.0, 0.25),
         true => (descriptor.lod_min_clamp, descriptor.lod_max_clamp),
     };
     let info = vk::SamplerCreateInfo::default()
