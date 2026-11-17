@@ -379,6 +379,28 @@ fn make_extended(controller: *mut Controller, class: &'static Class) -> Id {
     profile as Id
 }
 
+/// The profile class and `productCategory` macOS gives a pad of this kind.
+///
+/// A program that also reads pads as raw HID (SDL's PlayStation and Switch
+/// drivers) matches the category and class to tell that a GCController is a
+/// pad it already has; a DualSense named by its device name instead reaches it
+/// twice, and every press arrives doubled. `None` keeps the device name, as
+/// macOS does for a pad it has no profile for.
+fn pad_identity(kind: i32, vendor: u16, name: &str) -> (&'static std::ffi::CStr, Option<&'static str>) {
+    use sdl3::gamepad_type as t;
+    match kind {
+        t::PS5 => (c"GCDualSenseGamepad", Some("DualSense")),
+        t::PS4 => (c"GCDualShockGamepad", Some("DualShock 4")),
+        t::XBOX360 | t::XBOXONE => (c"GCXboxGamepad", Some("Xbox One")),
+        t::NINTENDO_SWITCH_PRO => (c"GCExtendedGamepad", Some("Switch Pro Controller")),
+        t::NINTENDO_SWITCH_JOYCON_PAIR => (c"GCExtendedGamepad", Some("Nintendo Switch Joy-Con (L/R)")),
+        _ if vendor == sdl3::usb_vendor::MICROSOFT || name.to_ascii_lowercase().contains("xbox") => {
+            (c"GCXboxGamepad", Some("Xbox One"))
+        }
+        _ => (c"GCExtendedGamepad", None),
+    }
+}
+
 fn make_controller(id: sdl3::JoystickId, gamepad: sdl3::Gamepad) -> Id {
     // SAFETY: `Controller` is the registered layout.
     let controller = unsafe { allocate::<Controller>(controller_class()) };
@@ -391,16 +413,13 @@ fn make_controller(id: sdl3::JoystickId, gamepad: sdl3::Gamepad) -> Id {
     let vendor_name = foundation::string::from_str(&name);
     // SAFETY: the same live gamepad handle used for its name and properties.
     let vendor = unsafe { sdl3::gamepad_vendor(gamepad) };
-    let is_xbox =
-        vendor == sdl3::usb_vendor::MICROSOFT || name.to_ascii_lowercase().contains("xbox");
+    // SAFETY: the same live gamepad handle.
+    let kind = unsafe { sdl3::gamepad_type(gamepad) };
+    let (profile, category) = pad_identity(kind, vendor, &name);
     trace_controller(format_args!(
-        "connected id={id} name={name:?} vendor={vendor:04x} xbox={is_xbox}"
+        "connected id={id} name={name:?} vendor={vendor:04x} type={kind} category={category:?}"
     ));
-    let profile_class = if is_xbox {
-        objc::class::lookup(c"GCXboxGamepad").expect("GameController is bootstrapped")
-    } else {
-        extended_class()
-    };
+    let profile_class = objc::class::lookup(profile).unwrap_or_else(extended_class);
     // SAFETY: a fresh instance.
     unsafe {
         (*controller).id = id;
@@ -409,7 +428,7 @@ fn make_controller(id: sdl3::JoystickId, gamepad: sdl3::Gamepad) -> Id {
         (*controller).extended = make_extended(controller, profile_class);
         (*controller).vendor_name = vendor_name;
         (*controller).product_category =
-            foundation::string::from_str(if is_xbox { "Xbox One" } else { &name });
+            foundation::string::from_str(category.unwrap_or(&name));
         (*controller).motion = std::ptr::null_mut();
         (*controller).light = if properties.mono_led || properties.rgb_led || properties.player_led
         {
@@ -1270,6 +1289,25 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_GCHapticsLocalityLeftTrigger", "LeftTrigger"),
     ("_GCHapticsLocalityRightTrigger", "RightTrigger"),
 ];
+
+#[cfg(test)]
+mod identity_tests {
+    use super::pad_identity;
+    use sdl3::gamepad_type as t;
+
+    #[test]
+    fn pads_carry_the_category_and_class_macos_gives_them() {
+        assert_eq!(pad_identity(t::PS5, 0x054c, "DualSense Wireless Controller"),
+            (c"GCDualSenseGamepad", Some("DualSense")));
+        assert_eq!(pad_identity(t::PS4, 0x054c, "PS4 Controller"),
+            (c"GCDualShockGamepad", Some("DualShock 4")));
+        assert_eq!(pad_identity(t::XBOXONE, 0x045e, "Xbox Series X Controller"),
+            (c"GCXboxGamepad", Some("Xbox One")));
+        // SDL not saying what it is: a Microsoft pad is still an Xbox one.
+        assert_eq!(pad_identity(0, 0x045e, "Controller").1, Some("Xbox One"));
+        assert_eq!(pad_identity(1, 0x1234, "Generic Pad"), (c"GCExtendedGamepad", None));
+    }
+}
 
 #[cfg(test)]
 mod tests {

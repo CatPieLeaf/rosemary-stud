@@ -183,6 +183,7 @@ struct Api {
     SDL_CloseGamepad: Option<unsafe extern "C" fn(Gamepad)>,
     SDL_GetGamepadName: Option<unsafe extern "C" fn(Gamepad) -> *const c_char>,
     SDL_GetGamepadVendor: Option<unsafe extern "C" fn(Gamepad) -> u16>,
+    SDL_GetGamepadType: Option<unsafe extern "C" fn(Gamepad) -> i32>,
     SDL_GetGamepadProperties: Option<unsafe extern "C" fn(Gamepad) -> PropertiesId>,
     SDL_GetBooleanProperty: Option<unsafe extern "C" fn(PropertiesId, *const c_char, bool) -> bool>,
     SDL_GetGamepadAxis: Option<unsafe extern "C" fn(Gamepad, c_int) -> i16>,
@@ -442,6 +443,7 @@ fn api() -> Option<&'static Api> {
             SDL_CloseGamepad,
             SDL_GetGamepadName,
             SDL_GetGamepadVendor,
+            SDL_GetGamepadType,
             SDL_GetGamepadProperties,
             SDL_GetBooleanProperty,
             SDL_GetGamepadAxis,
@@ -1085,6 +1087,28 @@ pub unsafe fn gamepad_name(gamepad: Gamepad) -> String {
 /// As [`close_gamepad`].
 pub unsafe fn gamepad_vendor(gamepad: Gamepad) -> u16 {
     match api().and_then(|a| a.SDL_GetGamepadVendor) {
+        Some(get) => unsafe { get(gamepad) },
+        None => 0,
+    }
+}
+
+/// `SDL_GamepadType` values.
+pub mod gamepad_type {
+    pub const XBOX360: i32 = 2;
+    pub const XBOXONE: i32 = 3;
+    pub const PS4: i32 = 5;
+    pub const PS5: i32 = 6;
+    pub const NINTENDO_SWITCH_PRO: i32 = 7;
+    pub const NINTENDO_SWITCH_JOYCON_PAIR: i32 = 10;
+}
+
+/// A gamepad's `SDL_GamepadType`, or zero (unknown) when SDL cannot say.
+///
+/// # Safety
+///
+/// As [`close_gamepad`].
+pub unsafe fn gamepad_type(gamepad: Gamepad) -> i32 {
+    match api().and_then(|a| a.SDL_GetGamepadType) {
         Some(get) => unsafe { get(gamepad) },
         None => 0,
     }
