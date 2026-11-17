@@ -406,6 +406,14 @@ pub(super) fn split_shared_merges(function: &mut Function) -> Result<bool, Trans
             .filter(|source| dominators.dominates(header, *source))
             .collect();
         if sources.is_empty() {
+            // Every arm of this header runs into blocks an enclosing condition
+            // shares: the `b` test of `(a && b) || c` reaches the outer true
+            // arm and the `c` test both. Give the header its own copy of what
+            // its arms reach before the merge, so its edges run through blocks
+            // it dominates and the next round can split the merge.
+            if isolate_header_paths(function, &graph, &dominators, &merges, header, merge)? {
+                return Ok(true);
+            }
             return Err(emission(
                 "a selection merge has no incoming edge dominated by its header",
             ));
@@ -448,6 +456,65 @@ pub(super) fn split_shared_merges(function: &mut Function) -> Result<bool, Trans
         ));
     }
     split_merge(function, merge, &sources);
+    Ok(true)
+}
+
+/// Copy, for `header` alone, the blocks its arms run into before `merge` that
+/// it does not dominate, and point its own edges at the copies. False when
+/// there is nothing to copy, or when what would be copied holds a block some
+/// construct is built on - a loop header, or a merge or continue target -
+/// whose copy would be a different construct rather than the same code.
+fn isolate_header_paths(
+    function: &mut Function,
+    graph: &ControlFlow,
+    dominators: &crate::ir::Dominance,
+    merges: &HashMap<BlockId, Merge>,
+    header: BlockId,
+    merge: BlockId,
+) -> Result<bool, TranslateError> {
+    let owned = |block: BlockId| block == header || dominators.dominates(header, block);
+    let redirects: Vec<(BlockId, BlockId)> = graph
+        .blocks
+        .iter()
+        .copied()
+        .filter(|block| owned(*block))
+        .flat_map(|block| {
+            graph.successors[&block]
+                .iter()
+                .copied()
+                .map(move |target| (block, target))
+        })
+        .filter(|(_, target)| *target != merge && !owned(*target))
+        .collect();
+    if redirects.is_empty() {
+        return Ok(false);
+    }
+    let mut region = BTreeSet::new();
+    let mut pending: Vec<_> = redirects.iter().map(|(_, target)| *target).collect();
+    while let Some(block) = pending.pop() {
+        if block == merge || !region.insert(block) {
+            continue;
+        }
+        pending.extend(graph.successors[&block].iter().copied());
+    }
+    let structural = merges.iter().any(|(construct, kind)| {
+        let (merge_block, continue_target) = match kind {
+            Merge::Selection { merge } => (*merge, None),
+            Merge::Loop {
+                merge,
+                continue_target,
+            } => (*merge, Some(*continue_target)),
+        };
+        let loop_header = matches!(kind, Merge::Loop { .. }).then_some(*construct);
+        [Some(merge_block), continue_target, loop_header]
+            .into_iter()
+            .flatten()
+            .any(|block| region.contains(&block))
+    });
+    if structural {
+        return Ok(false);
+    }
+    clone_region(function, &region, &redirects)?;
     Ok(true)
 }
 

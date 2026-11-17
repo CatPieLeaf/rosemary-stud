@@ -1815,6 +1815,74 @@ fn gives_each_short_circuit_selection_its_own_merge() {
     assert_eq!(merges, 2);
 }
 
+/// `(a && b) || c || d`, the shape of Roblox's cloud reprojection shader: the
+/// `b` test's arms both run into blocks the `c` test shares, so no edge into
+/// the common merge belongs to the `b` test alone. The structurizer copies
+/// those blocks for it rather than giving up on the shader.
+#[test]
+fn structures_a_test_whose_arms_both_enter_shared_blocks() {
+    let block = |id: u32, terminator: Terminator| Block {
+        id: BlockId(id),
+        name: format!("b{id}"),
+        instructions: Vec::new(),
+        terminator,
+    };
+    let test = |id: u32, taken: u32, not_taken: u32| {
+        block(
+            id,
+            Terminator::CondBranch {
+                condition: Operand::Bool(true),
+                true_block: BlockId(taken),
+                false_block: BlockId(not_taken),
+            },
+        )
+    };
+    let function = Function {
+        name: "and_or_or".to_string(),
+        result: Type::Void,
+        parameters: Vec::new(),
+        values: Vec::new(),
+        blocks: vec![
+            test(0, 1, 2), // a
+            test(1, 3, 2), // b
+            test(2, 3, 4), // c
+            test(4, 3, 5), // d
+            block(3, Terminator::Branch(BlockId(6))),
+            block(5, Terminator::Branch(BlockId(6))),
+            block(6, Terminator::Return(None)),
+        ],
+    };
+    let module = Module {
+        static_initializers: Vec::new(),
+        globals: Vec::new(),
+        functions: vec![function],
+        entries: vec![EntryPoint {
+            early_fragment_tests: false,
+            function: 0,
+            stage: Stage::Fragment,
+            resources: Vec::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }],
+    };
+    let artifact = emit_spirv(&module, &TargetProfile::vulkan_1_3())
+        .expect("the shape structures")
+        .entries
+        .remove(0);
+    let parsed = rspirv::dr::load_words(&artifact.words).unwrap();
+    let count = |op: Op| {
+        parsed.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .filter(|instruction| instruction.class.opcode == op)
+            .count()
+    };
+    // Every conditional branch is a construct of its own.
+    assert_eq!(count(Op::SelectionMerge), count(Op::BranchConditional));
+    assert!(count(Op::BranchConditional) >= 4);
+}
+
 /// Metal returns from several places; SPIR-V needs one returning block so
 /// every conditional above them has somewhere to rejoin.
 #[test]
