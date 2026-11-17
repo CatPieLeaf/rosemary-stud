@@ -235,6 +235,7 @@ struct Api {
     SDL_CreateSurfaceFrom:
         Option<unsafe extern "C" fn(c_int, c_int, u32, *mut c_void, c_int) -> *mut c_void>,
     SDL_DestroySurface: Option<unsafe extern "C" fn(*mut c_void)>,
+    SDL_ScaleSurface: Option<unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int) -> *mut c_void>,
     SDL_GetWindowSurface: Option<unsafe extern "C" fn(Window) -> *mut Surface>,
     SDL_UpdateWindowSurface: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_LockSurface: Option<unsafe extern "C" fn(*mut Surface) -> bool>,
@@ -488,6 +489,7 @@ fn api() -> Option<&'static Api> {
             SDL_SetWindowIcon,
             SDL_CreateSurfaceFrom,
             SDL_DestroySurface,
+            SDL_ScaleSurface,
             SDL_GetWindowSurface,
             SDL_UpdateWindowSurface,
             SDL_LockSurface,
@@ -5022,12 +5024,17 @@ pub mod video {
     /// SDL converts the surface into its own representation, so the pixels do
     /// not have to outlive the call - the cursor does, and belongs to the
     /// caller until [`destroy_cursor`].
+    ///
+    /// `shown` is the size the cursor appears at, in the window system's
+    /// pixels, which the bitmap is resampled to when it differs; the hot spot
+    /// is in those pixels.
     pub fn create_color_cursor(
         width: i32,
         height: i32,
         pixels: &[u8],
         hot_x: i32,
         hot_y: i32,
+        shown: (i32, i32),
     ) -> Option<Cursor> {
         if pixels.len() != (width as usize) * (height as usize) * 4 {
             return None;
@@ -5051,6 +5058,18 @@ pub mod video {
         if surface.is_null() {
             return None;
         }
+        // SAFETY: a live surface; SDL returns a new one or null.
+        let scaled = match (shown != (width, height), api.SDL_ScaleSurface) {
+            (true, Some(scale)) if shown.0 > 0 && shown.1 > 0 => unsafe {
+                scale(surface, shown.0, shown.1, 1 /* SDL_SCALEMODE_LINEAR */)
+            },
+            _ => std::ptr::null_mut(),
+        };
+        if !scaled.is_null() {
+            // SAFETY: the original, replaced by its scaled copy.
+            unsafe { destroy(surface) };
+        }
+        let surface = if scaled.is_null() { surface } else { scaled };
         // SAFETY: a surface just made, and a point SDL clamps itself.
         let cursor = unsafe { create(surface, hot_x, hot_y) };
         // SAFETY: as above; SDL has taken its own copy by now.

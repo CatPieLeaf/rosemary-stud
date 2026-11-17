@@ -92,6 +92,23 @@ unsafe extern "C" fn tracking_user_info(receiver: Id, _sel: Sel) -> Id {
 /// The hot spot is in the image's points and the bitmap is in pixels, which
 /// differ for an image whose representation is 2x. An image reporting no size
 /// is taken as one point per pixel, since that is the only ratio available.
+/// The pixels a cursor of `size` points shows at: on X11, whose pixels are
+/// not points, the points at the desktop's scale, as Wayland shows the same
+/// image; elsewhere the bitmap's own. An image with no size keeps the bitmap's.
+fn shown_size(size: NSSize, width: u32, height: u32, x11_scale: Option<f32>) -> (i32, i32) {
+    match x11_scale {
+        Some(scale) if size.width > 0.0 && size.height > 0.0 => (
+            ((size.width * f64::from(scale)).round() as i32).max(1),
+            ((size.height * f64::from(scale)).round() as i32).max(1),
+        ),
+        _ => (width as i32, height as i32),
+    }
+}
+
+fn x11_scale() -> Option<f32> {
+    sdl3::video::is_x11().then(sdl3::video::x11_scale)
+}
+
 fn hot_spot_pixels(hot_spot: NSPoint, size: NSSize, width: u32, height: u32) -> (i32, i32) {
     let scale = |point: f64, extent: f64, pixels: u32| match extent > 0.0 {
         true => point * f64::from(pixels) / extent,
@@ -180,7 +197,7 @@ fn transparent_cursor(size: NSSize, hot_spot: NSPoint) -> sdl3::Cursor {
     let (width, height) = (side(size.width), side(size.height));
     let pixels = vec![0u8; (width * height * 4) as usize];
     let (x, y) = hot_spot_pixels(hot_spot, size, width, height);
-    sdl3::video::create_color_cursor(width as i32, height as i32, &pixels, x, y)
+    sdl3::video::create_color_cursor(width as i32, height as i32, &pixels, x, y, (width as i32, height as i32))
         .unwrap_or(std::ptr::null_mut())
 }
 
@@ -204,13 +221,15 @@ fn cursor_from_image(image: Id, hot_spot: NSPoint) -> sdl3::Cursor {
         return std::ptr::null_mut();
     };
     let size = crate::image::declared_size(image);
-    let (x, y) = hot_spot_pixels(hot_spot, size, bitmap.width, bitmap.height);
+    let shown = shown_size(size, bitmap.width, bitmap.height, x11_scale());
+    let (x, y) = hot_spot_pixels(hot_spot, size, shown.0 as u32, shown.1 as u32);
     sdl3::video::create_color_cursor(
         bitmap.width as i32,
         bitmap.height as i32,
         &bitmap.pixels,
         x,
         y,
+        shown,
     )
     .unwrap_or(std::ptr::null_mut())
 }
@@ -1312,6 +1331,14 @@ mod tests {
 
     /// A 2x image's point is in points and its pixels are not, so the two
     /// differ by the scale - and an image with no size is one to one.
+    #[test]
+    fn an_x11_cursor_shows_at_its_points_times_the_desktop_scale() {
+        let size = NSSize { width: 64.0, height: 64.0 };
+        assert_eq!(shown_size(size, 128, 128, Some(1.25)), (80, 80));
+        assert_eq!(shown_size(size, 128, 128, None), (128, 128));
+        assert_eq!(shown_size(NSSize::default(), 16, 16, Some(2.0)), (16, 16));
+    }
+
     #[test]
     fn the_point_is_scaled_to_the_pixels() {
         let hot_spot = NSPoint { x: 4.0, y: 6.0 };
