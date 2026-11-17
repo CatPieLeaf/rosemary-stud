@@ -318,6 +318,20 @@ fn placed_origin(sdl: sdl3::Window) -> Option<(i32, i32)> {
 
 /// The pointer on the desktop, in SDL's coordinates, and the held buttons.
 ///
+/// [`desktop_mouse_state`] for a program polling where the pointer is: while
+/// none of its windows has the keyboard, where the pointer last was while one
+/// did. Hovering a window that is not focused is the desktop's pointer passing
+/// over it, and a program that polls rather than waiting for mouse moves would
+/// otherwise follow it as input.
+pub(crate) fn polled_mouse_state() -> Option<(f32, f32, u32)> {
+    static HELD: std::sync::Mutex<Option<(f32, f32, u32)>> = std::sync::Mutex::new(None);
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    if crate::cursor::focused() || held.is_none() {
+        *held = desktop_mouse_state();
+    }
+    *held
+}
+
 /// Measured from the window the pointer is in rather than asked of SDL, whose
 /// global answer on Wayland adds its own placeholder origin instead of the one
 /// [`global_position`] reports.
@@ -1986,7 +2000,7 @@ pub fn pointer_location(window: Id) -> NSPoint {
     }
     let point = match crate::script::pointer().or_else(crate::event::frozen_pointer) {
         Some((x, y)) => crate::geometry::point_from_sdl(x as f64, y as f64),
-        None => match desktop_mouse_state() {
+        None => match polled_mouse_state() {
             Some((x, y, _)) => crate::geometry::point_from_sdl(x as f64, y as f64),
             None => return NSPoint::default(),
         },

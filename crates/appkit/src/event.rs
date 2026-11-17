@@ -491,6 +491,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         }
         Event::WindowFocus { window, gained } => {
             crate::decor::focus_changed(window, gained);
+            crate::cursor::focus_changed();
             // Control may be let go where this pump never hears of it.
             if !gained {
                 leave_edit_chord(0);
@@ -500,15 +501,21 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             }
             let object = object_for(window);
             if !gained {
+                crate::screen::forget_unfocused_warp();
                 reset_pointer_motion();
                 crate::screen::forget_recentring();
                 crate::screen::release_relative_pointer(window);
             }
             if !object.is_null() && gained {
                 window::set_key_window(object);
+                // A Mac's key window is its front one. A compositor can give
+                // the keyboard before it raises the window, and a game taking
+                // the pointer then takes it under the windows still on top.
+                sdl3::video::raise_window(sdl3::video::window_from_id(window));
                 // SDL drops relative mouse mode when focus goes, and a window
                 // made while the guest was disassociated never entered it.
                 crate::screen::apply_mouse_association();
+                crate::screen::replay_unfocused_warp();
                 crate::screen::confine_pointer(object);
             }
             match gained {
@@ -625,6 +632,13 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             }
             // The first real motion after a warp is the one that reports it.
             let warped = take_warp_delta();
+            // A disassociated pointer's deltas are the device's alone, as on a
+            // Mac: a warp moves a cursor that is not following the mouse, and
+            // adding its distance turned the warp into a camera jump.
+            let warped = match crate::screen::mouse_is_associated() {
+                true => warped,
+                false => (0.0, 0.0),
+            };
             crate::screen::note_recentring_motion();
             // Ending puts the physical cursor where the guest's pointer is,
             // so that is where this motion is reported; while it lasts, SDL's
@@ -663,6 +677,12 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             // when it broke the link, which is what CoreGraphics does and what
             // SDL, still tracking a position inside the window, does not.
             let (x, y) = track_pointer(id, x, y);
+            // A Mac sends mouse moves to the key window only. Hovering a window
+            // that does not have the keyboard is the desktop's pointer passing
+            // over it, not input for the program.
+            if !crate::cursor::focused() {
+                return;
+            }
             if !mouse_inside_logical_window(id, x, y) && !capture_allows_drag(id, buttons) {
                 crate::cursor::forget_tracking(object_for(id));
                 return;
@@ -767,7 +787,8 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         // was last over - which is where the wheel turned.
         Event::MouseWheel { window: id, x, y } => {
             let at = *POINTER.lock().unwrap_or_else(|e| e.into_inner());
-            if !mouse_inside_logical_window(id, at.0, at.1) {
+            // Not for a window without the keyboard, as mouse moves are not.
+            if !mouse_inside_logical_window(id, at.0, at.1) || !crate::cursor::focused() {
                 return;
             }
             send(id, Some(at), |window, location| Fields {

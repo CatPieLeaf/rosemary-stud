@@ -130,6 +130,29 @@ fn bands(size: (i32, i32), clip: Rect) -> Vec<XRectangle> {
         .collect()
 }
 
+/// Give `window` no input region, so every click goes through it. False when
+/// X11 or the Shape extension is not there.
+pub fn pass_input(window: Window) -> bool {
+    let Some(x) = xlib() else {
+        return false;
+    };
+    let Some((display, native)) = video::x11_native_window(window) else {
+        return false;
+    };
+    // SAFETY: SDL's live display and window.
+    unsafe {
+        (x.lock)(display);
+        let (mut event, mut error) = (0, 0);
+        let supported = (x.shape_query)(display, &mut event, &mut error) != 0;
+        if supported {
+            // ShapeInput, no rectangles, ShapeSet.
+            (x.shape)(display, native as NativeWindow, 2, 0, 0, std::ptr::null(), 0, 0, 0);
+        }
+        (x.unlock)(display);
+        supported
+    }
+}
+
 /// Set or clear the visual mask without touching the guest's OpenGL context.
 /// Returns false when X11/Shape is not available. `clip` is in host window
 /// (not pixel-density-scaled) coordinates.

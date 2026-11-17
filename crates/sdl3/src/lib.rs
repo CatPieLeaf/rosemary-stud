@@ -5286,6 +5286,44 @@ pub mod video {
         (!display.is_null() && handle != 0).then_some((display, handle as u64))
     }
 
+    /// Whether `window`'s X server is Xwayland, which has the `XWAYLAND`
+    /// extension: its pointer belongs to the Wayland compositor, so XFixes
+    /// barriers do not hold it, and it locks the pointer only while no X
+    /// cursor is shown. Asked once.
+    #[cfg(target_os = "linux")]
+    pub fn is_xwayland(window: Window) -> bool {
+        static XWAYLAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let Some((display, _)) = x11_native_window(window) else {
+            return false;
+        };
+        *XWAYLAND.get_or_init(|| unsafe {
+            let x11 = libc::dlopen(c"libX11.so.6".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if x11.is_null() {
+                return false;
+            }
+            let query = libc::dlsym(x11, c"XQueryExtension".as_ptr());
+            if query.is_null() {
+                return false;
+            }
+            type Query = unsafe extern "C" fn(
+                *mut c_void,
+                *const std::ffi::c_char,
+                *mut c_int,
+                *mut c_int,
+                *mut c_int,
+            ) -> c_int;
+            let query: Query = std::mem::transmute(query);
+            let (mut opcode, mut event, mut error) = (0, 0, 0);
+            // SAFETY: SDL's live display and a NUL-terminated extension name.
+            query(display, c"XWAYLAND".as_ptr(), &mut opcode, &mut event, &mut error) != 0
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn is_xwayland(_window: Window) -> bool {
+        false
+    }
+
     /// A window's `wl_display` and `wl_surface`, on Wayland.
     pub fn wayland_surface(window: Window) -> Option<(*mut c_void, *mut c_void)> {
         let api = api()?;

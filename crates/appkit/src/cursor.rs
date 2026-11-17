@@ -149,12 +149,268 @@ fn show(cursor: Id) {
     // Recorded apart from `SHOWN`: every named cursor shares the null SDL
     // cursor, and `+currentSystemCursor` has to tell them apart.
     SHOWN_OBJECT.store(cursor as usize, std::sync::atomic::Ordering::Release);
+    // A Mac applies a program's cursor in its key window only: an inactive
+    // window under the pointer shows the desktop's. On Wayland and X11 the
+    // pointer takes a window's cursor on entry, focused or not.
+    let sdl = if focused() { sdl } else { std::ptr::null_mut() };
     // Only on a change: this runs on every mouse move, and SDL redraws the
     // pointer for each call whether or not it is the cursor already shown.
     if SHOWN.swap(sdl as usize, std::sync::atomic::Ordering::AcqRel) == sdl as usize {
         return;
     }
     sdl3::video::set_cursor(sdl);
+    refresh_drawn();
+}
+
+/// The cursor drawn by this runtime under Xwayland while the guest's pointer
+/// is disassociated from the mouse.
+///
+/// An X server holds the pointer at the frozen point with a one-pixel
+/// barrier. Xwayland does not enforce barriers - the pointer is the Wayland
+/// compositor's - so there it escapes and is warped back on every motion, and
+/// the cursor twitches. Xwayland locks the pointer (a Wayland lock) only while
+/// no X cursor is shown. So under Xwayland the hardware cursor is hidden then,
+/// and the guest's own cursor image is shown at its frozen point by a
+/// transparent popup. Only for an image cursor: a named one has no pixels
+/// here, and keeps the hardware cursor.
+struct Drawn {
+    popup: usize,
+    parent: usize,
+    cursor: usize,
+    at: (i32, i32),
+    /// The popup's size in points while shown.
+    size: (i32, i32),
+    /// The popup's RGBA pixels at its own size, their width appended.
+    pixels: Vec<u8>,
+    /// Paints still to make: the first can land before the window is mapped
+    /// and be lost, so the next few refreshes paint again.
+    repaints: u8,
+    /// Cleared and shrunk rather than unmapped or destroyed: a compositor
+    /// fades a window out as it goes, which left a ghost of the cursor.
+    hidden: bool,
+}
+
+static DRAWN: std::sync::Mutex<Option<Drawn>> = std::sync::Mutex::new(None);
+
+/// Whether the disassociated pointer's cursor is drawn here: under Xwayland,
+/// for an image cursor.
+pub(crate) fn drawable() -> bool {
+    drawable_cursor().is_some()
+        && crate::event::pointer_window().is_some_and(sdl3::video::is_xwayland)
+}
+
+fn drawable_cursor() -> Option<Id> {
+    let cursor = SHOWN_OBJECT.load(std::sync::atomic::Ordering::Acquire) as Id;
+    if cursor.is_null() || !is_cursor(cursor) {
+        return None;
+    }
+    // SAFETY: a cursor of this crate's.
+    let image = unsafe { (*(cursor as *const Cursor)).image };
+    (!image.is_null()).then_some(cursor)
+}
+
+/// Show, move or take away the drawn cursor to match the guest's state now.
+/// Main thread only, which is where SDL's windows live.
+pub(crate) fn refresh_drawn() {
+    if !sdl3::video::is_video_thread() {
+        return;
+    }
+    let target = drawn_target();
+    let mut drawn = DRAWN.lock().unwrap_or_else(|e| e.into_inner());
+    // A popup belongs to one window: another window, or none left, ends it.
+    let parent_gone = drawn.as_ref().is_some_and(|d| {
+        target.is_some_and(|(parent, ..)| d.parent != parent as usize)
+            || !crate::window::sdl_windows().contains(&(d.parent as sdl3::Window))
+    });
+    if parent_gone && let Some(old) = drawn.take() {
+        sdl3::video::destroy_window(old.popup as sdl3::Window);
+    }
+    match (drawn.as_mut(), target) {
+        (Some(current), Some((_, cursor, at))) => {
+            let popup = current.popup as sdl3::Window;
+            if current.cursor != cursor as usize
+                && let Some((size, pixels)) = render(cursor)
+            {
+                current.cursor = cursor as usize;
+                current.size = size;
+                current.pixels = pixels;
+                current.repaints = 3;
+                if !current.hidden {
+                    sdl3::video::set_window_size(popup, size.0, size.1);
+                }
+            }
+            if current.hidden {
+                current.hidden = false;
+                current.repaints = 3;
+                sdl3::video::set_window_size(popup, current.size.0, current.size.1);
+                sdl3::video::set_window_position(popup, at.0, at.1);
+                current.at = at;
+            }
+            if current.at != at {
+                sdl3::video::set_window_position(popup, at.0, at.1);
+                current.at = at;
+            }
+            if current.repaints > 0 {
+                current.repaints -= 1;
+                paint(popup, &current.pixels);
+            }
+        }
+        (Some(current), None) => {
+            if !current.hidden {
+                current.hidden = true;
+                let popup = current.popup as sdl3::Window;
+                paint(popup, &[0, 0, 0, 0, 1, 0, 0, 0]);
+                sdl3::video::set_window_size(popup, 1, 1);
+            }
+        }
+        (None, Some((parent, cursor, at))) => {
+            if let Some((popup, size, pixels)) = draw(parent, cursor, at) {
+                *drawn = Some(Drawn {
+                    popup: popup as usize,
+                    parent: parent as usize,
+                    cursor: cursor as usize,
+                    at,
+                    size,
+                    pixels,
+                    repaints: 3,
+                    hidden: false,
+                });
+            }
+        }
+        (None, None) => {}
+    }
+}
+
+/// The window, cursor and popup origin (in the window's points) to draw, or
+/// `None` when the hardware cursor is the one to see.
+fn drawn_target() -> Option<(sdl3::Window, Id, (i32, i32))> {
+    if !sdl3::video::is_x11() || crate::screen::mouse_is_associated() || !wants_visible() {
+        return None;
+    }
+    let cursor = drawable_cursor()?;
+    let frozen = crate::event::frozen_pointer()?;
+    let parent = crate::event::pointer_window().filter(|w| sdl3::video::is_xwayland(*w))?;
+    let origin = crate::window::global_position(parent).unwrap_or((0, 0));
+    // SAFETY: a cursor of this crate's.
+    let hot_spot = unsafe { (*(cursor as *const Cursor)).hot_spot };
+    Some((
+        parent,
+        cursor,
+        (
+            (frozen.0 - origin.0 as f32 - hot_spot.x as f32).round() as i32,
+            (frozen.1 - origin.1 as f32 - hot_spot.y as f32).round() as i32,
+        ),
+    ))
+}
+
+/// The size in points to show `cursor` at, and its RGBA pixels at that size
+/// in X pixels, their width appended.
+fn render(cursor: Id) -> Option<((i32, i32), Vec<u8>)> {
+    // SAFETY: a cursor of this crate's.
+    let image = unsafe { (*(cursor as *const Cursor)).image };
+    let bitmap = crate::image::bitmap(image)?;
+    let size = crate::image::declared_size(image);
+    let points = match size.width > 0.0 && size.height > 0.0 {
+        true => (size.width.ceil() as i32, size.height.ceil() as i32),
+        false => (bitmap.width as i32, bitmap.height as i32),
+    };
+    let scale = sdl3::video::x11_scale();
+    let width = ((points.0 as f32 * scale).round() as u32).max(1);
+    let height = ((points.1 as f32 * scale).round() as u32).max(1);
+    let mut pixels = resample(&bitmap, width, height);
+    pixels.extend_from_slice(&width.to_ne_bytes());
+    Some((points, pixels))
+}
+
+/// Make the popup for `cursor` at `at`, painted, shown and closed to input.
+///
+/// Transparent: Xwayland's windows are composited by the Wayland compositor,
+/// which blends the image's own alpha.
+fn draw(
+    parent: sdl3::Window,
+    cursor: Id,
+    at: (i32, i32),
+) -> Option<(sdl3::Window, (i32, i32), Vec<u8>)> {
+    let (size, pixels) = render(cursor)?;
+    let flags = sdl3::video::flags::TOOLTIP
+        | sdl3::video::flags::NOT_FOCUSABLE
+        | sdl3::video::flags::TRANSPARENT
+        | sdl3::video::flags::HIDDEN;
+    let popup = sdl3::video::create_popup_window(parent, at.0, at.1, size.0, size.1, flags)?;
+    sdl3::x11_mask::pass_input(popup);
+    sdl3::video::show_window(popup);
+    paint(popup, &pixels);
+    Some((popup, size, pixels))
+}
+
+/// Paint RGBA `pixels` (their width appended) into the popup's surface, as
+/// premultiplied BGRA: the byte order of SDL's 32-bit X11 window surfaces,
+/// and the alpha a compositor blends.
+fn paint(popup: sdl3::Window, pixels: &[u8]) {
+    let Some(width) = pixels
+        .len()
+        .checked_sub(4)
+        .map(|n| u32::from_ne_bytes(pixels[n..].try_into().unwrap_or_default()) as usize)
+        .filter(|w| *w > 0)
+    else {
+        return;
+    };
+    let rgba = &pixels[..pixels.len() - 4];
+    let height = rgba.len() / 4 / width;
+    sdl3::video::present_window(popup, |surface| {
+        let (w, h) = (surface.width.max(0) as usize, surface.height.max(0) as usize);
+        let length = surface.pitch as usize * h;
+        // SAFETY: SDL reported `pitch` bytes per row for `height` rows, and
+        // the surface is locked for the duration of this call.
+        let out = unsafe { std::slice::from_raw_parts_mut(surface.pixels, length) };
+        out.fill(0);
+        for y in 0..h.min(height) {
+            for x in 0..w.min(width) {
+                let from = (y * width + x) * 4;
+                let to = y * surface.pitch as usize + x * 4;
+                let a = u32::from(rgba[from + 3]);
+                let premultiply = |c: u8| ((u32::from(c) * a + 127) / 255) as u8;
+                out[to] = premultiply(rgba[from + 2]);
+                out[to + 1] = premultiply(rgba[from + 1]);
+                out[to + 2] = premultiply(rgba[from]);
+                out[to + 3] = a as u8;
+            }
+        }
+        true
+    });
+}
+
+/// `bitmap`'s RGBA pixels resampled to `width` by `height`, bilinearly and
+/// with alpha weighting, so a scaled edge keeps its colour.
+fn resample(bitmap: &crate::raster::Bitmap, width: u32, height: u32) -> Vec<u8> {
+    let (bw, bh) = (bitmap.width.max(1) as usize, bitmap.height.max(1) as usize);
+    let at = |x: usize, y: usize| -> [f32; 4] {
+        let i = (y.min(bh - 1) * bw + x.min(bw - 1)) * 4;
+        let p = &bitmap.pixels[i..i + 4];
+        let a = f32::from(p[3]) / 255.0;
+        [f32::from(p[0]) * a, f32::from(p[1]) * a, f32::from(p[2]) * a, f32::from(p[3])]
+    };
+    let mut out = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height as usize {
+        let sy = ((y as f32 + 0.5) * bh as f32 / height as f32 - 0.5).max(0.0);
+        let (y0, fy) = (sy as usize, sy.fract());
+        for x in 0..width as usize {
+            let sx = ((x as f32 + 0.5) * bw as f32 / width as f32 - 0.5).max(0.0);
+            let (x0, fx) = (sx as usize, sx.fract());
+            let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+            let mut p = [0f32; 4];
+            for k in 0..4 {
+                p[k] = (a[k] * (1.0 - fx) + b[k] * fx) * (1.0 - fy) + (c[k] * (1.0 - fx) + d[k] * fx) * fy;
+            }
+            let i = (y * width as usize + x) * 4;
+            let alpha = p[3] / 255.0;
+            for k in 0..3 {
+                out[i + k] = if alpha > 0.0 { (p[k] / alpha).round().clamp(0.0, 255.0) as u8 } else { 0 };
+            }
+            out[i + 3] = p[3].round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
 }
 
 /// The SDL cursor a cursor object shows. A named cursor's is made the first
@@ -1092,7 +1348,23 @@ fn wants_visible() -> bool {
 pub fn sync_visibility() {
     let over_chrome = OVER_CHROME.load(std::sync::atomic::Ordering::Acquire);
     let forced = FORCED_VISIBLE.load(std::sync::atomic::Ordering::Acquire);
-    sdl3::video::set_cursor_visible(over_chrome || forced || wants_visible());
+    // A hide is the key window's too: hovering an inactive one shows the pointer.
+    sdl3::video::set_cursor_visible(over_chrome || forced || wants_visible() || !focused());
+    refresh_drawn();
+}
+
+/// Whether one of this program's windows has the keyboard: a Mac's key window.
+pub(crate) fn focused() -> bool {
+    crate::window::sdl_windows()
+        .iter()
+        .any(|w| sdl3::video::window_flags(*w) & sdl3::video::flags::INPUT_FOCUS != 0)
+}
+
+/// Put the program's cursor and its hide back, or the desktop's pointer, as a
+/// window takes or loses the keyboard.
+pub(crate) fn focus_changed() {
+    show(SHOWN_OBJECT.load(std::sync::atomic::Ordering::Acquire) as Id);
+    sync_visibility();
 }
 
 /// Set while one of Rosemary's own dialogs is up, which needs a pointer to
@@ -1337,6 +1609,14 @@ mod tests {
         assert_eq!(shown_size(size, 128, 128, Some(1.25)), (80, 80));
         assert_eq!(shown_size(size, 128, 128, None), (128, 128));
         assert_eq!(shown_size(NSSize::default(), 16, 16, Some(2.0)), (16, 16));
+    }
+
+    #[test]
+    fn resampling_to_the_same_size_keeps_the_pixels() {
+        let bitmap = crate::raster::Bitmap { width: 2, height: 1, pixels: vec![255, 0, 0, 255, 0, 0, 255, 0] };
+        let out = resample(&bitmap, 2, 1);
+        assert_eq!(&out[0..4], &[255, 0, 0, 255]);
+        assert_eq!(out[7], 0);
     }
 
     #[test]

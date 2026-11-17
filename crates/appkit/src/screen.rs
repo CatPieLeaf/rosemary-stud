@@ -1448,9 +1448,22 @@ mod tests {
 pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::NSPoint) -> i32 {
     let asked = point;
     let point = (point.x as f32, point.y as f32);
+    let windows = crate::window::sdl_windows();
+    // The window under the pointer is not the focused one when it is only
+    // hovered, and a game that warps to the centre every frame would take
+    // the desktop's pointer from whatever does have focus. Nothing of the
+    // warp is done then - not even the delta the next motion would report,
+    // which no motion consumes while unfocused - only the last one is kept,
+    // to be made whole once a window has the keyboard.
+    let focused = windows
+        .iter()
+        .any(|w| sdl3::video::window_flags(*w) & sdl3::video::flags::INPUT_FOCUS != 0);
+    if !focused {
+        *UNFOCUSED_WARP.lock().unwrap_or_else(|e| e.into_inner()) = Some((asked.x, asked.y));
+        return 0;
+    }
     // An edge hold is not the guest's relative mode: the warp is a plain one.
     end_edge_hold();
-    let windows = crate::window::sdl_windows();
     let target = sdl3::video::mouse_focus().or_else(crate::event::pointer_window);
     let origin = target
         .and_then(crate::window::global_position)
@@ -1497,6 +1510,8 @@ pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::
             clear_relative_pointer_lock(*window);
         }
     }
+    // A warp moves the frozen point the drawn cursor sits at.
+    crate::cursor::refresh_drawn();
     let warped = repeated || warp_physical(target, point, local);
     for window in relative {
         // Also repairs a pointer that drifted from a repeated target.
@@ -1738,6 +1753,27 @@ pub fn mouse_is_associated() -> bool {
     ASSOCIATED.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// The last warp asked for while no window had the keyboard. A click on a
+/// window reaches the program before the window has the keyboard, and a game
+/// warps to its centre on that click: the warp is made when the keyboard
+/// arrives, so one click both focuses the window and lets the game take the
+/// pointer.
+static UNFOCUSED_WARP: std::sync::Mutex<Option<(f64, f64)>> = std::sync::Mutex::new(None);
+
+/// A window took the keyboard: make the warp the guest asked for before it did.
+pub(crate) fn replay_unfocused_warp() {
+    let held = UNFOCUSED_WARP.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some((x, y)) = held {
+        // SAFETY: a point, as the guest passed it.
+        unsafe { CGWarpMouseCursorPosition(foundation::geometry::NSPoint { x, y }) };
+    }
+}
+
+/// A window lost the keyboard: a warp from before is no longer one to make.
+pub(crate) fn forget_unfocused_warp() {
+    *UNFOCUSED_WARP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// `ROSEMARY_CONFINE_POINTER=1`: keep the pointer inside whichever window has
 /// focus.
 ///
@@ -1964,6 +2000,11 @@ fn lock_relative_pointer(window: sdl3::Window, point: (f32, f32)) {
         // SDL 3.4 and XI2 raw events: this produces no false camera delta.
         sdl3::video::warp_mouse_global(global.0, global.1);
     }
+    // Under Xwayland, which enforces no barrier, an image cursor is drawn
+    // instead and the hidden pointer is locked (`crate::cursor::refresh_drawn`).
+    if crate::cursor::drawable() {
+        return;
+    }
     let installed = if sdl3::video::get_mouse_rect(window) != Some(rect) {
         // A fullscreen/resize/confinement transition can replace the active
         // barrier. SDL uses cached rect equality to skip reinstallation; drop
@@ -2109,7 +2150,12 @@ pub fn apply_mouse_association() {
     // it was, and only `+[NSCursor hide]` takes it away - which this tree
     // already counts in `crate::cursor`. SDL's relative mode hides the pointer
     // itself, so the hint is what stops it from making that decision twice.
-    sdl3::video::set_hint(sdl3::video::HINT_RELATIVE_CURSOR_VISIBLE, c"1");
+    //
+    // Except under Xwayland with an image cursor, which is drawn at the frozen
+    // point instead: Xwayland locks the pointer only with no X cursor shown
+    // (see `crate::cursor::refresh_drawn`).
+    let drawn = relative && crate::cursor::drawable();
+    sdl3::video::set_hint(sdl3::video::HINT_RELATIVE_CURSOR_VISIBLE, if drawn { c"0" } else { c"1" });
     let mut changed = false;
     for window in crate::window::sdl_windows() {
         if !relative {
@@ -2142,6 +2188,7 @@ pub fn apply_mouse_association() {
     if changed {
         forget_relative_warp();
     }
+    crate::cursor::refresh_drawn();
 }
 
 /// `bool CGEventSourceKeyState(CGEventSourceStateID, CGKeyCode)`.
