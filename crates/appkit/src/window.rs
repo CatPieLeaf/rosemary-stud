@@ -2143,6 +2143,38 @@ unsafe extern "C" fn frame_rect_for_content_style(
     frame_for_content(rect, inset_of(receiver, style_mask, false))
 }
 
+thread_local! {
+    /// Sizes asked of SDL windows since the run loop last turned, the latest
+    /// for each.
+    static SIZES: std::cell::RefCell<Vec<(usize, i32, i32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Ask for `window` to be `width` by `height` once this turn of the run loop
+/// is done. A program can set a frame and set it back at once - Qt laying out
+/// a dialog sets it one pixel tall and back to its height - and passed on as
+/// they come, the window kept the passing size: SDL had taken the first
+/// request and still counted the second as the size the window already had.
+fn request_size(window: sdl3::Window, width: i32, height: i32) {
+    SIZES.with(|sizes| {
+        let mut sizes = sizes.borrow_mut();
+        sizes.retain(|(other, _, _)| *other != window as usize);
+        sizes.push((window as usize, width, height));
+    });
+}
+
+/// Give SDL the sizes asked for during the turn just ended.
+pub(crate) fn apply_requested_sizes() {
+    let sizes = SIZES.with(|sizes| std::mem::take(&mut *sizes.borrow_mut()));
+    for (window, width, height) in sizes {
+        let window = window as sdl3::Window;
+        // Gone meanwhile, or already that size.
+        if window_for(window).is_null() || sdl3::video::window_size(window) == Some((width, height)) {
+            continue;
+        }
+        sdl3::video::set_window_size(window, width, height);
+    }
+}
+
 unsafe extern "C" fn set_frame(receiver: Id, _sel: Sel, rect: NSRect) {
     if is_fullscreen(window_of(receiver).sdl) {
         set_fullscreen_frame(receiver, rect);
@@ -2161,7 +2193,7 @@ unsafe extern "C" fn set_frame(receiver: Id, _sel: Sel, rect: NSRect) {
          {width}x{height})",
         rect.origin.x, rect.origin.y, rect.size.width, rect.size.height,
     );
-    sdl3::video::set_window_size(sdl, width.max(1), height.max(1));
+    request_size(sdl, width.max(1), height.max(1));
     sdl3::video::set_window_position(sdl, local_x, local_y);
     // A hidden window takes the size at once and reports no resize, and a
     // shown one reports it later: the content view follows now either way.

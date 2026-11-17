@@ -42,6 +42,8 @@ pub fn pump(app: Id) -> bool {
     // a thread that is not drawing, and reaching here is what says this one has
     // finished with it. See `opengl::release_for_other_threads`.
     crate::opengl::release_for_other_threads();
+    // What the program sized during its turn, once, at its last size.
+    window::apply_requested_sizes();
     gamecontroller::pump();
     debug_resize();
     debug_key();
