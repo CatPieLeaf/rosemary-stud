@@ -2432,6 +2432,11 @@ pub mod video {
             // SDL inhibits the screensaver while video is up; macOS apps
             // only do so by asserting power assertions themselves.
             set_hint(HINT_ALLOW_SCREENSAVER, c"1");
+            // Closing a Mac app's last window is `-performClose:`, which the
+            // program may answer with its own leave screen; it is not
+            // `-terminate:`. With SDL's default the compositor's close button
+            // sent both, and the quit tore the program down mid-close.
+            set_hint(c"SDL_QUIT_ON_LAST_WINDOW_CLOSE", c"0");
             *up = super::init(super::init::VIDEO).is_ok();
             if *up {
                 // This thread now owns the event queue: see [`super::pump`].
