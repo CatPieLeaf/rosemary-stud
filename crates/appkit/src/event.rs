@@ -632,13 +632,6 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             }
             // The first real motion after a warp is the one that reports it.
             let warped = take_warp_delta();
-            // A disassociated pointer's deltas are the device's alone, as on a
-            // Mac: a warp moves a cursor that is not following the mouse, and
-            // adding its distance turned the warp into a camera jump.
-            let warped = match crate::screen::mouse_is_associated() {
-                true => warped,
-                false => (0.0, 0.0),
-            };
             crate::screen::note_recentring_motion();
             // Ending puts the physical cursor where the guest's pointer is,
             // so that is where this motion is reported; while it lasts, SDL's
@@ -1666,6 +1659,11 @@ pub(crate) fn note_warp_delta(dx: f64, dy: f64) {
 
 fn take_warp_delta() -> (f64, f64) {
     std::mem::take(&mut *WARP_DELTA.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Drop the delta a warp left for the next motion to report.
+pub(crate) fn forget_warp_delta() {
+    take_warp_delta();
 }
 
 /// A warp or relative delta from before focus was lost must not be consumed
