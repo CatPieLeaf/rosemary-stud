@@ -2445,9 +2445,16 @@ pub mod video {
         X11_SCALE.get().copied().unwrap_or(1.0)
     }
 
+    /// Runs inside [`init_video`], under its lock: so it asks SDL for the
+    /// primary display itself, as [`primary_display`] would take that lock
+    /// again and never return.
     fn settle_x11_scale() {
         let scale = match is_x11() {
-            true => display_content_scale(primary_display()),
+            true => {
+                // SAFETY: video is up; SDL takes no arguments here.
+                let primary = api().and_then(|a| a.SDL_GetPrimaryDisplay).map_or(0, |f| unsafe { f() });
+                display_content_scale(primary)
+            }
             false => 1.0,
         };
         let _ = X11_SCALE.set(if scale.is_finite() && scale > 0.0 { scale } else { 1.0 });
