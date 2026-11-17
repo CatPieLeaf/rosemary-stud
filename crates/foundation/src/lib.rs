@@ -6,6 +6,28 @@
     clippy::unnecessary_cast
 )]
 
+/// A method's entry that hands its target the guest caller's return address
+/// as a fourth argument, for [`objc::api::return_owned`]: `objc_msgSend` jumps
+/// to a method, so that address is still on top of the stack.
+macro_rules! with_caller {
+    ($name:ident, $target:path) => {
+        #[cfg(target_arch = "x86_64")]
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name(_: objc::object::Id, _: objc::sel::Sel, _: objc::object::Id) -> objc::object::Id {
+            core::arch::naked_asm!("mov rcx, [rsp]", "jmp {target}", target = sym $target)
+        }
+        #[cfg(target_arch = "aarch64")]
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name(_: objc::object::Id, _: objc::sel::Sel, _: objc::object::Id) -> objc::object::Id {
+            core::arch::naked_asm!("mov x3, x30", "b {target}", target = sym $target)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        unsafe extern "C" fn $name(receiver: objc::object::Id, sel: objc::sel::Sel, argument: objc::object::Id) -> objc::object::Id {
+            unsafe { $target(receiver, sel, argument, 0) }
+        }
+    };
+}
+
 pub mod appleevent;
 pub mod attributed_string;
 mod block;

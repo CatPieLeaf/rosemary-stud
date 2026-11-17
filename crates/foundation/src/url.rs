@@ -13,14 +13,18 @@ pub unsafe fn text_of(receiver: Id) -> Option<String> {
         .map(|u| u.text.clone())
 }
 
-/// `+URLWithString:`, autoreleased.
+// Roblox's HTTP thread, which has no pool, makes one for every request.
+with_caller!(url_with_string, url_with_string_from);
+
+/// `+URLWithString:`, handed off or autoreleased.
 ///
 /// nil for text that is not a URL, which is what Apple's answers and what a
 /// caller checks for. "Not a URL" is only the empty string here: a scheme this
 /// runtime does not recognise is still a URL, and refusing it would be this
 /// module deciding what the transport is allowed to be asked for.
-unsafe extern "C" fn url_with_string(_class: Id, _sel: Sel, text: Id) -> Id {
-    objc::arc::autorelease(unsafe { make_url_with_string(text) })
+unsafe extern "C" fn url_with_string_from(_class: Id, _sel: Sel, text: Id, ra: usize) -> Id {
+    // SAFETY: `ra` came from `with_caller!`.
+    unsafe { objc::api::return_owned(make_url_with_string(text), ra) }
 }
 
 unsafe fn make_url_with_string(text: Id) -> Id {

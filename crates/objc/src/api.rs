@@ -1379,6 +1379,25 @@ mod handoff {
     }
 }
 
+/// Return `object`, which carries a reference the caller is owed, from a
+/// method whose guest caller returns to `ra`: handed straight to a caller that
+/// claims it, as `objc_autoreleaseReturnValue` does, and autoreleased otherwise.
+///
+/// For a method implemented here, which ends in no `objc_autoreleaseReturnValue`
+/// of its own: without the handoff, everything it returns on a thread with no
+/// pool is leaked.
+///
+/// # Safety
+///
+/// `ra` is a code address in the caller, or zero.
+pub unsafe fn return_owned(object: Id, ra: usize) -> Id {
+    match ra {
+        0 => crate::arc::autorelease(object),
+        // SAFETY: the caller's obligation.
+        _ => unsafe { handoff::give(object, ra) },
+    }
+}
+
 /// Enters `$target(object, return address)`.
 macro_rules! with_return_address {
     ($name:ident, $target:path) => {

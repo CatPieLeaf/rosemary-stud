@@ -187,8 +187,21 @@ fn make_cookie(cookie: Cookie) -> Id {
     unsafe {
         (*(object as *mut CookieObject)).cookie = Box::into_raw(Box::new(cookie));
     }
-    // SAFETY: a fresh object the caller does not own.
-    unsafe { corefoundation::api::CFAutorelease(object as CFTypeRef) as Id }
+    object
+}
+
+/// An array that owns `objects`, releasing this call's references to them.
+fn owning_array(objects: &[CFTypeRef]) -> Id {
+    let array = corefoundation::collections::new_array(
+        objects,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    for object in objects {
+        // SAFETY: the array retained it; this was the caller's own reference.
+        unsafe { corefoundation::api::CFRelease(*object) };
+    }
+    array as Id
 }
 
 /// The text of an `NSString`, or the empty string for nil.
@@ -213,13 +226,17 @@ unsafe fn host_and_path(url: Id) -> (String, String) {
     if url.is_null() {
         return (String::new(), "/".to_string());
     }
+    // The answer is autoreleased, and a caller's thread may have no pool.
+    let pool = objc::arc::pool_push();
     // SAFETY: `-absoluteString` is `id (id, SEL)`.
     let string = unsafe {
         let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
         f(url, objc::sel::get("absoluteString"))
     };
     // SAFETY: an `NSString`, or nil.
-    split_url(&unsafe { text(string) })
+    let parts = split_url(&unsafe { text(string) });
+    objc::arc::pool_pop(pool);
+    parts
 }
 
 fn split_url(absolute: &str) -> (String, String) {
@@ -296,7 +313,7 @@ unsafe extern "C" fn cookie_with_properties(_class: Id, _sel: Sel, properties: I
         true => None,
         false => unsafe { expiry(object(&["NSHTTPCookieExpires", "Expires", "expires"])) },
     };
-    make_cookie(Cookie {
+    objc::arc::autorelease(make_cookie(Cookie {
         name,
         value,
         domain,
@@ -306,7 +323,7 @@ unsafe extern "C" fn cookie_with_properties(_class: Id, _sel: Sel, properties: I
         },
         secure,
         expires,
-    })
+    }))
 }
 
 /// The host in an `NSHTTPCookieOriginURL`, which Apple's takes as either an
@@ -413,13 +430,7 @@ unsafe extern "C" fn cookies_with_response_header_fields(
             made.push(make_cookie(cookie) as CFTypeRef);
         }
     }
-    let array = corefoundation::collections::new_array(
-        &made,
-        corefoundation::callbacks::Policy::from_type_callbacks(),
-        false,
-    );
-    // SAFETY: a fresh array this call owns.
-    unsafe { corefoundation::api::CFAutorelease(array) as Id }
+    objc::arc::autorelease(owning_array(&made))
 }
 
 fn parse_set_cookie(header: &str, host: &str) -> Option<Cookie> {
@@ -681,18 +692,13 @@ unsafe extern "C" fn shared_storage(class: Id, _sel: Sel) -> Id {
     }) as Id
 }
 
+/// An owned array of fresh `NSHTTPCookie`s.
 fn cookie_array(cookies: Vec<Cookie>) -> Id {
     let objects: Vec<CFTypeRef> = cookies
         .into_iter()
         .map(|c| make_cookie(c) as CFTypeRef)
         .collect();
-    let array = corefoundation::collections::new_array(
-        &objects,
-        corefoundation::callbacks::Policy::from_type_callbacks(),
-        false,
-    );
-    // SAFETY: a fresh array this call owns.
-    unsafe { corefoundation::api::CFAutorelease(array) as Id }
+    owning_array(&objects)
 }
 
 unsafe extern "C" fn storage_cookies(_receiver: Id, _sel: Sel) -> Id {
@@ -703,7 +709,7 @@ unsafe extern "C" fn storage_cookies(_receiver: Id, _sel: Sel) -> Id {
         .cloned()
         .collect();
     trace(format_args!("-cookies -> {} ({})", all.len(), names(&all)));
-    cookie_array(all)
+    objc::arc::autorelease(cookie_array(all))
 }
 
 /// The names in a cookie list, for [`trace`].
@@ -715,7 +721,11 @@ fn names(cookies: &[Cookie]) -> String {
         .join(", ")
 }
 
-unsafe extern "C" fn cookies_for_url(_receiver: Id, _sel: Sel, url: Id) -> Id {
+// Roblox's HTTP thread, which has no pool, asks this and the header fields
+// for every request; the handoff is what frees what they return.
+with_caller!(cookies_for_url, cookies_for_url_from);
+
+unsafe extern "C" fn cookies_for_url_from(_receiver: Id, _sel: Sel, url: Id, ra: usize) -> Id {
     // SAFETY: null or an `NSURL`.
     let (host, path) = unsafe { host_and_path(url) };
     let now = now();
@@ -729,7 +739,8 @@ unsafe extern "C" fn cookies_for_url(_receiver: Id, _sel: Sel, url: Id) -> Id {
         matching.len(),
         names(&matching)
     ));
-    cookie_array(matching)
+    // SAFETY: `ra` came from `with_caller!`.
+    unsafe { objc::api::return_owned(cookie_array(matching), ra) }
 }
 
 unsafe extern "C" fn set_cookie(_receiver: Id, _sel: Sel, cookie: Id) {
@@ -782,9 +793,16 @@ unsafe extern "C" fn set_cookies_for_url(
     }
 }
 
-/// `+[NSHTTPCookie requestHeaderFieldsWithCookies:]`, the inverse of
-/// `+cookiesWithResponseHeaderFields:forURL:`.
-unsafe extern "C" fn request_header_fields(_class: Id, _sel: Sel, cookies: Id) -> Id {
+// `+[NSHTTPCookie requestHeaderFieldsWithCookies:]`, the inverse of
+// `+cookiesWithResponseHeaderFields:forURL:`.
+with_caller!(request_header_fields, request_header_fields_from);
+
+unsafe extern "C" fn request_header_fields_from(
+    _class: Id,
+    _sel: Sel,
+    cookies: Id,
+    ra: usize,
+) -> Id {
     // SAFETY: null or an `NSArray`.
     let count = unsafe { corefoundation::api::CFArrayGetCount(cookies as CFTypeRef) };
     let mut header = String::new();
@@ -813,8 +831,9 @@ unsafe extern "C" fn request_header_fields(_class: Id, _sel: Sel, cookies: Id) -
     unsafe {
         corefoundation::api::CFRelease(key as CFTypeRef);
         corefoundation::api::CFRelease(value as CFTypeRef);
-        corefoundation::api::CFAutorelease(dictionary) as Id
     }
+    // SAFETY: `ra` came from `with_caller!`.
+    unsafe { objc::api::return_owned(dictionary as Id, ra) }
 }
 
 /// `-setCookieAcceptPolicy:` and its getter.
