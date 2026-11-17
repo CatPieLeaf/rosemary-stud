@@ -32,7 +32,7 @@ pub use memory::Fill;
 pub use placement::Placement;
 pub use submit::{Batch, Commit};
 use trace::dump_spirv;
-pub use trace::{milestone, trace, trace_once};
+pub use trace::{milestone, report_once, trace, trace_once};
 
 type DescriptorLayoutKey = (Vec<(u32, vk::DescriptorType)>, vk::ShaderStageFlags, bool);
 type DescriptorLayouts = HashMap<DescriptorLayoutKey, vk::DescriptorSetLayout>;

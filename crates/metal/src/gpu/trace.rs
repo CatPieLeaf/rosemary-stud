@@ -53,6 +53,21 @@ pub fn trace(message: impl std::fmt::Display) {
     }
 }
 
+/// Report a failure the guest is about to see, once per message, whether or
+/// not tracing is on: a program handed nil often crashes on it with nothing
+/// else to say why.
+pub fn report_once(message: impl std::fmt::Display) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let message = message.to_string();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&message) {
+        return;
+    }
+    eprintln!("rosemary: Metal: {message}");
+    seen.push(message);
+}
+
 /// Report a message once however often the runtime reaches it, so that a gap a
 /// frame runs into does not fill the log.
 pub fn trace_once(message: impl std::fmt::Display) {

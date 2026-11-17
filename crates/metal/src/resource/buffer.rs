@@ -112,7 +112,7 @@ pub(crate) fn new_buffer(gpu: &'static Gpu, length: usize, options: u64, fill: g
         }) {
             Ok(inner) => inner,
             Err(reason) => {
-                gpu::trace(format!("newBufferWithLength: failed: {reason}"));
+                gpu::report_once(format!("newBufferWithLength: {length} bytes failed: {reason}"));
                 return std::ptr::null_mut();
             }
         },

@@ -106,11 +106,33 @@ impl Heap {
             true => size,
             false => size.max(BLOCK),
         };
-        let block = crate::stats::timed(crate::stats::Counter::BufferBlockMicros, || {
+        let fresh = crate::stats::timed(crate::stats::Counter::BufferBlockMicros, || {
             self.block(device, capacity)
-        })?;
+        });
+        let (block, own) = match fresh {
+            Ok(block) => (block, size > BLOCK || dedicate_everything()),
+            // The device would not allocate or map another block. A GPU behind
+            // a virtual machine - Venus, on a Chromebook - maps only a bounded
+            // window of memory, which the blocks kept mapped here fill: give
+            // back every empty one, and ask for no more than this allocation.
+            Err(first) if self.mapped || capacity > size => {
+                for memory in state.take_empty_blocks() {
+                    // SAFETY: an empty block has no live buffer bound into it,
+                    // and every buffer that was is destroyed and idle.
+                    unsafe { self.release_memory(device, memory) };
+                }
+                match self.block(device, size) {
+                    Ok(block) => (block, true),
+                    Err(second) => {
+                        return Err(format!("{first}; and for {size} bytes alone: {second}"));
+                    }
+                }
+            }
+            Err(first) => return Err(first),
+        };
+        let capacity = block.size;
         let index = state.place(block);
-        if size > BLOCK || dedicate_everything() {
+        if own {
             // Its own block, freed when it is: nothing else is cut from it.
             state.dedicated.push(index);
             let block = &mut state.blocks[index];
@@ -262,6 +284,23 @@ impl State {
         self.blocks
             .get(index)
             .is_some_and(|block| block.size > 0 && block.generation == generation)
+    }
+
+    /// Every wholly-free shared block, taken out of service: its memory, for
+    /// the caller to release.
+    fn take_empty_blocks(&mut self) -> Vec<vk::DeviceMemory> {
+        let mut taken = Vec::new();
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            let empty = block.size > 0 && block.free.len() == 1 && block.free[0] == (0, block.size);
+            if !empty || self.dedicated.contains(&index) {
+                continue;
+            }
+            taken.push(std::mem::replace(&mut block.memory, vk::DeviceMemory::null()));
+            block.contents = std::ptr::null_mut();
+            block.size = 0;
+            block.free.clear();
+        }
+        taken
     }
 
     /// A wholly-free block to give back, once a second one is also free.
@@ -491,5 +530,45 @@ mod tests {
             state.blocks[0].release(allocation.offset, allocation.size);
         }
         assert_eq!(state.blocks[0].free, [(0, 1024)]);
+    }
+}
+
+#[cfg(test)]
+mod take_empty_tests {
+    use super::*;
+    use ash::vk::Handle;
+
+    fn block(memory: u64, size: u64, free: Vec<(u64, u64)>) -> Block {
+        Block {
+            memory: vk::DeviceMemory::from_raw(memory),
+            contents: std::ptr::null_mut(),
+            size,
+            free,
+            reached: 0,
+            generation: memory,
+        }
+    }
+
+    /// When the device will not map more, only blocks nothing lives in are
+    /// given back: not a block with a buffer in it, and not one a large buffer
+    /// owns outright.
+    #[test]
+    fn take_empty_blocks_takes_only_empty_shared_blocks() {
+        let mut state = State {
+            blocks: vec![
+                block(1, 64, vec![(0, 64)]),
+                block(2, 64, vec![(16, 48)]),
+                block(3, 64, vec![(0, 64)]),
+                block(4, 0, vec![]),
+            ],
+            dedicated: vec![2],
+            generations: 4,
+        };
+        let taken: Vec<u64> = state.take_empty_blocks().iter().map(|m| m.as_raw()).collect();
+        assert_eq!(taken, vec![1]);
+        assert_eq!(state.blocks[0].size, 0, "the empty block is spent");
+        assert_eq!(state.blocks[1].size, 64, "a block with a buffer in it stays");
+        assert_eq!(state.blocks[2].size, 64, "a dedicated block stays");
+        assert!(!state.owns(0, 1), "a range from the spent block is no longer its own");
     }
 }
