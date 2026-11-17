@@ -134,20 +134,12 @@ pub fn open(unit: &mut Unit, spec: sdl3::AudioSpec, handle: *mut c_void) -> bool
     }
 }
 
-/// Close a unit's device, if it has one.
-///
-/// # Safety
-///
-/// No other thread may be inside this unit's stream. SDL's own destroy waits for
-/// its callback, which is the only other caller.
-pub unsafe fn close(unit: &mut Unit) {
-    if unit.stream.is_null() {
-        return;
-    }
-    // SAFETY: the caller's obligation; the handle came from `open`.
-    unsafe { sdl3::audio::destroy(unit.stream) };
-    unit.stream = std::ptr::null_mut();
+/// Detach a unit's playback stream, for the caller to destroy once it has
+/// released the unit's lock: SDL's destroy waits for a callback in flight, and
+/// that callback ([`crate::render::feed`]) takes the lock.
+pub fn detach(unit: &mut Unit) -> sdl3::AudioStream {
     unit.running = false;
+    std::mem::replace(&mut unit.stream, std::ptr::null_mut())
 }
 
 #[cfg(test)]

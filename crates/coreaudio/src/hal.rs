@@ -1018,7 +1018,7 @@ pub unsafe extern "C" fn AudioDeviceDestroyIOProcID(object: ObjectId, id: *mut c
         Err(status) => return status,
     };
     // SAFETY: `stop` owns the stream and leaves none behind.
-    unsafe { stop(&mut registration.lock().unwrap_or_else(|e| e.into_inner())) };
+    unsafe { stop(&registration) };
     PROCS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1050,6 +1050,8 @@ pub unsafe extern "C" fn AudioDeviceStart(object: ObjectId, id: *mut c_void) -> 
         return UNSUPPORTED;
     };
     started.stream = stream;
+    // Outside the lock, for the reason `stop` gives.
+    drop(started);
     // SAFETY: a stream this crate just opened.
     unsafe { sdl3::audio::resume(stream) };
     crate::trace::say(format_args!("start device {object}"), SUCCESS);
@@ -1064,20 +1066,26 @@ pub unsafe extern "C" fn AudioDeviceStop(object: ObjectId, id: *mut c_void) -> i
     };
     // SAFETY: SDL's destroy waits for its own callback, which is the only other
     // caller.
-    unsafe { stop(&mut registration.lock().unwrap_or_else(|e| e.into_inner())) };
+    unsafe { stop(&registration) };
     SUCCESS
 }
 
+/// Destroy a proc's stream after releasing its lock: SDL holds the device lock
+/// while `drive` or `capture` waits for this one, and its destroy waits for
+/// that callback. The callback finds the stream gone and returns.
+///
 /// # Safety
 ///
-/// No other thread may be inside this proc's stream.
-unsafe fn stop(registration: &mut Proc) {
-    if registration.stream.is_null() {
-        return;
+/// No other thread may still use this proc's stream handle.
+unsafe fn stop(registration: &std::sync::Mutex<Proc>) {
+    let stream = std::mem::replace(
+        &mut registration.lock().unwrap_or_else(|e| e.into_inner()).stream,
+        std::ptr::null_mut(),
+    );
+    if !stream.is_null() {
+        // SAFETY: the caller's obligation; the handle came from `AudioDeviceStart`.
+        unsafe { sdl3::audio::destroy(stream) };
     }
-    // SAFETY: the caller's obligation; the handle came from `AudioDeviceStart`.
-    unsafe { sdl3::audio::destroy(registration.stream) };
-    registration.stream = std::ptr::null_mut();
 }
 
 fn empty_list() -> AudioBufferList {

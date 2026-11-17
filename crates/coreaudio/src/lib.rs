@@ -357,19 +357,24 @@ pub unsafe extern "C" fn AudioComponentInstanceDispose(handle: *mut c_void) -> i
     SUCCESS
 }
 
-/// Close both of a unit's streams. The recording stream is destroyed after the
-/// lock is released, as [`capture::destroy`] requires.
+/// Close both of a unit's streams, destroying them after the lock is released:
+/// SDL holds a stream's device lock while it calls [`render::feed`], which takes
+/// the unit's lock, so destroying one under the unit's lock deadlocks against a
+/// callback in flight.
 ///
 /// # Safety
 ///
-/// As [`stream::close`].
+/// No other thread may still use the unit's stream handles.
 unsafe fn close(unit: &Mutex<Unit>) {
-    let capture = {
+    let (stream, capture) = {
         let mut unit = unit.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the caller's obligation.
-        unsafe { stream::close(&mut unit) };
-        std::mem::replace(&mut unit.capture, std::ptr::null_mut())
+        let stream = stream::detach(&mut unit);
+        (stream, std::mem::replace(&mut unit.capture, std::ptr::null_mut()))
     };
+    if !stream.is_null() {
+        // SAFETY: taken out of the unit, with its lock released.
+        unsafe { sdl3::audio::destroy(stream) };
+    }
     // SAFETY: taken out of the unit, with its lock released.
     unsafe { capture::destroy(capture) };
 }
@@ -446,7 +451,10 @@ pub unsafe extern "C" fn AudioOutputUnitStart(handle: *mut c_void) -> i32 {
         return UNINITIALIZED;
     }
     unit.running = true;
-    for stream in [unit.stream, unit.capture] {
+    let streams = [unit.stream, unit.capture];
+    // Outside the lock, as in `AudioOutputUnitStop`.
+    drop(unit);
+    for stream in streams {
         if !stream.is_null() {
             // SAFETY: a stream this crate opened.
             unsafe { sdl3::audio::resume(stream) };
@@ -461,19 +469,20 @@ pub unsafe extern "C" fn AudioOutputUnitStop(handle: *mut c_void) -> i32 {
     let Some(unit) = unit_for(handle) else {
         return foreign::status(c"AudioOutputUnitStop", handle).unwrap_or(INVALID_COMPONENT);
     };
-    let capture = {
+    // `running` is cleared under the lock, so no render callback reaches the
+    // guest once this returns; the pauses happen outside it, because SDL takes
+    // its device lock to pause, and holds that lock while its playback thread
+    // waits in `render::feed` for this one.
+    let streams = {
         let mut unit = unit.lock().unwrap_or_else(|e| e.into_inner());
-        if !unit.stream.is_null() {
-            // SAFETY: a stream this crate opened.
-            unsafe { sdl3::audio::pause(unit.stream) };
-        }
         unit.running = false;
-        unit.capture
+        [unit.stream, unit.capture]
     };
-    // Outside the lock, for the reason `close` gives.
-    if !capture.is_null() {
-        // SAFETY: a stream this crate opened.
-        unsafe { sdl3::audio::pause(capture) };
+    for stream in streams {
+        if !stream.is_null() {
+            // SAFETY: a stream this crate opened.
+            unsafe { sdl3::audio::pause(stream) };
+        }
     }
     SUCCESS
 }
