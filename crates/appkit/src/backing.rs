@@ -2556,6 +2556,14 @@ pub(crate) fn live_metal_occlusion(
     }
     let opaque = opaque_views(&place_tree(window, sdl));
     let native_id_bit = 1usize << (usize::BITS - 1);
+    let chrome = crate::decor::pixels(sdl)
+        .filter(|chrome| chrome.over_content)
+        .map(|chrome| Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(chrome.width),
+            height: i64::from(chrome.height),
+        });
     scene
         .iter()
         .enumerate()
@@ -2567,7 +2575,7 @@ pub(crate) fn live_metal_occlusion(
                 width: i64::from(layer.frame.width),
                 height: i64::from(layer.frame.height),
             };
-            let covered = scene[index + 1..]
+            let mut covered: Vec<Rect> = scene[index + 1..]
                 .iter()
                 .filter(|native| {
                     native.layer & native_id_bit != 0
@@ -2598,6 +2606,11 @@ pub(crate) fn live_metal_occlusion(
                 })
                 .filter(|rect| !rect.is_empty())
                 .collect();
+            covered.extend(
+                chrome
+                    .map(|chrome| chrome.intersection(&metal))
+                    .filter(|rect| !rect.is_empty()),
+            );
             (layer.layer, covered)
         })
         .collect()
@@ -4256,12 +4269,22 @@ pub fn remove_overlay(view: Id) {
 /// in `sdl`'s window, which that layer's presents must not draw over.
 pub fn covered(sdl: sdl3::Window, layer: Id) -> Vec<Rect> {
     let windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
-    windows
+    let mut rects = windows
         .as_ref()
         .and_then(|windows| windows.get(&(sdl as usize)))
         .and_then(|state| state.covered.iter().find(|(key, _)| *key == layer as usize))
         .map(|(_, rects)| rects.clone())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    drop(windows);
+    if let Some(chrome) = crate::decor::pixels(sdl).filter(|chrome| chrome.over_content) {
+        rects.push(Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(chrome.width),
+            height: i64::from(chrome.height),
+        });
+    }
+    rects
 }
 
 /// Have `view`'s window presented again, composing it if nothing has been:

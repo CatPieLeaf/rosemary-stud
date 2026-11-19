@@ -139,26 +139,22 @@ pub(crate) struct Facts {
     /// Straight RGBA the titlebar is filled with, for a window whose titlebar
     /// appears transparent; `None` draws the usual bar.
     pub titlebar_color: Option<[u8; 4]>,
-    /// `NSWindowStyleMaskFullSizeContentView`: the content runs under the
-    /// titlebar, which a desktop's opaque decoration cannot do.
     pub full_size: bool,
 }
 
-/// Whether the titlebar is drawn here: always for client decorations, and for
-/// a full-size-content window under server ones.
-pub(crate) fn draws_titlebar(config: Config, full_size: bool) -> bool {
-    config.decorations == Decorations::Client || full_size
+pub(crate) fn titlebar_height() -> f64 {
+    f64::from(theme().titlebar_height)
 }
 
 /// The height of chrome above a window's content, in points.
-pub(crate) fn inset_for(config: Config, titled: bool, panel: bool, fullscreen: bool, titlebar: bool) -> f64 {
+pub(crate) fn inset_for(config: Config, titled: bool, panel: bool, fullscreen: bool) -> f64 {
     if !titled || fullscreen {
         return 0.0;
     }
     let theme = theme();
-    let titlebar = match titlebar {
-        true => theme.titlebar_height,
-        false => 0.0,
+    let titlebar = match config.decorations {
+        Decorations::Client => theme.titlebar_height,
+        Decorations::Server => 0.0,
     };
     let strip = match config.menu == MenuPlacement::Strip && !panel {
         true => theme.strip_height,
@@ -169,9 +165,8 @@ pub(crate) fn inset_for(config: Config, titled: bool, panel: bool, fullscreen: b
 
 fn rows(config: Config, facts: &Facts) -> (f32, f32) {
     let theme = theme();
-    let own = draws_titlebar(config, facts.full_size);
-    let inset = inset_for(config, facts.titled, facts.panel, facts.fullscreen, own) as f32;
-    let titlebar = match own && inset > 0.0 {
+    let inset = inset_for(config, facts.titled, facts.panel, facts.fullscreen) as f32;
+    let titlebar = match config.decorations == Decorations::Client && inset > 0.0 {
         true => theme.titlebar_height,
         false => 0.0,
     };
@@ -190,6 +185,8 @@ pub struct Pixels {
     /// ones. The top corners are already cut out of `pixels`; the bottom ones
     /// are the presenter's to cut.
     pub radius: f32,
+    /// The content under it leaves these rows to it.
+    pub over_content: bool,
 }
 
 /// Keyed by SDL window address, for whichever thread presents it.
@@ -573,7 +570,7 @@ pub(crate) fn pump() {
             false => 1.0,
         };
         let inset = titlebar_height + strip_height;
-        let rounded = draws_titlebar(config, facts.full_size) && rounds(sdl);
+        let rounded = config.decorations == Decorations::Client && rounds(sdl);
         let size = (
             pixel_width.max(1) as u32,
             (inset * scale).round().max(1.0) as u32,
@@ -595,6 +592,7 @@ pub(crate) fn pump() {
                     && c.size == size
                     && c.titlebar == titlebar
                     && c.strip == strip
+                    && c.pixels.over_content == facts.full_size
             });
             if unchanged {
                 return None;
@@ -649,6 +647,7 @@ pub(crate) fn pump() {
                 pixels,
                 generation,
                 radius,
+                over_content: facts.full_size,
             });
             chromes.insert(
                 window as usize,
@@ -685,7 +684,7 @@ pub(crate) fn pump() {
             .unwrap_or_else(|e| e.into_inner())
             .get_or_insert_with(HashMap::new)
             .insert(sdl as usize, pixels);
-        if draws_titlebar(config, facts.full_size) {
+        if config.decorations == Decorations::Client {
             let wayland = sdl3::video::wayland_surface(sdl);
             if let Some((display, _)) = wayland {
                 sdl3::wayland::watch(display);
@@ -1055,7 +1054,7 @@ pub(crate) fn reveal_popup() -> Option<sdl3::Window> {
 /// its top: at the top edge the chrome slides in, and once the pointer is
 /// below it again the chrome slides out.
 fn full_screen_pointer(window: Id, y: f32) {
-    if inset_for(config(), true, false, false, config().decorations == Decorations::Client) <= 0.0 {
+    if inset_for(config(), true, false, false) <= 0.0 {
         return;
     }
     // SAFETY: a window this crate made.
@@ -1809,25 +1808,23 @@ mod tests {
         let client = Config::parse(None, None);
         let titlebar = f64::from(theme.titlebar_height);
         let strip = f64::from(theme.strip_height);
-        assert_eq!(inset_for(client, true, false, false, true), titlebar);
-        assert_eq!(inset_for(client, false, false, false, true), 0.0);
-        assert_eq!(inset_for(client, true, false, true, true), 0.0, "full screen");
+        assert_eq!(inset_for(client, true, false, false), titlebar);
+        assert_eq!(inset_for(client, false, false, false), 0.0);
+        assert_eq!(inset_for(client, true, false, true), 0.0, "full screen");
 
         let client_strip = Config::parse(None, Some("strip"));
         assert_eq!(
-            inset_for(client_strip, true, false, false, true),
+            inset_for(client_strip, true, false, false),
             titlebar + strip
         );
         // A panel has no menu bar of its own.
-        assert_eq!(inset_for(client_strip, true, true, false, true), titlebar);
+        assert_eq!(inset_for(client_strip, true, true, false), titlebar);
 
         let server = Config::parse(Some("server"), None);
-        assert_eq!(inset_for(server, true, false, false, false), strip);
-        assert_eq!(inset_for(server, true, true, false, false), 0.0);
+        assert_eq!(inset_for(server, true, false, false), strip);
+        assert_eq!(inset_for(server, true, true, false), 0.0);
         let server_bare = Config::parse(Some("server"), Some("none"));
-        assert_eq!(inset_for(server_bare, true, false, false, false), 0.0);
-        assert!(draws_titlebar(server, true), "a full-size window under server decorations");
-        assert!(!draws_titlebar(server, false));
+        assert_eq!(inset_for(server_bare, true, false, false), 0.0);
     }
 
     /// The reveal slides in and out over `REVEAL_SECONDS`, may turn back

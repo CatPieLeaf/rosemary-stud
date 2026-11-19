@@ -853,14 +853,13 @@ pub(crate) fn content_inset(object: Id) -> CGFloat {
 }
 
 fn inset_of(object: Id, style_mask: usize, fullscreen: bool) -> CGFloat {
-    // A full-size content view starts at the window's top, under the titlebar.
-    crate::decor::inset_for(
-        crate::decor::config(),
-        style_mask & style::TITLED != 0,
-        is_panel(object),
-        fullscreen,
-        draws_own_titlebar() && style_mask & style::FULL_SIZE_CONTENT_VIEW == 0,
-    )
+    let titled = style_mask & style::TITLED != 0;
+    let chrome = crate::decor::inset_for(crate::decor::config(), titled, is_panel(object), fullscreen);
+    // As on a Mac, what an app draws in a full-size view's top hides under the titlebar.
+    match titled && !fullscreen && style_mask & style::FULL_SIZE_CONTENT_VIEW != 0 {
+        true => chrome - crate::decor::titlebar_height(),
+        false => chrome,
+    }
 }
 
 fn is_fullscreen(sdl: sdl3::Window) -> bool {
@@ -2082,11 +2081,11 @@ fn content_for_frame(rect: NSRect, inset: CGFloat) -> NSRect {
 /// above the content. With the host's decorations that is nothing, since the
 /// host's title bar is outside SDL's window.
 unsafe extern "C" fn content_rect_for_frame(receiver: Id, _sel: Sel, rect: NSRect) -> NSRect {
-    content_for_frame(rect, content_inset(receiver))
+    content_for_frame(rect, content_inset(receiver).max(0.0))
 }
 
 unsafe extern "C" fn frame_rect_for_content(receiver: Id, _sel: Sel, rect: NSRect) -> NSRect {
-    frame_for_content(rect, content_inset(receiver))
+    frame_for_content(rect, content_inset(receiver).max(0.0))
 }
 
 /// `-contentLayoutRect`: in window coordinates, the part of the frame the chrome
@@ -2098,7 +2097,11 @@ unsafe extern "C" fn content_layout_rect(receiver: Id, _sel: Sel) -> NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
         size,
     };
-    content_for_frame(whole, content_inset(receiver))
+    let inset = match window_of(receiver).style_mask & style::FULL_SIZE_CONTENT_VIEW != 0 {
+        true => content_inset(receiver).max(crate::decor::titlebar_height()),
+        false => content_inset(receiver),
+    };
+    content_for_frame(whole, inset)
 }
 
 /// `-setMouseConfinementRect:` (10.13): keep the pointer inside `rect`, in window
@@ -2149,7 +2152,7 @@ unsafe extern "C" fn content_rect_for_frame_style(
     rect: NSRect,
     style_mask: usize,
 ) -> NSRect {
-    content_for_frame(rect, inset_of(receiver, style_mask, false))
+    content_for_frame(rect, inset_of(receiver, style_mask, false).max(0.0))
 }
 
 unsafe extern "C" fn frame_rect_for_content_style(
@@ -2158,7 +2161,7 @@ unsafe extern "C" fn frame_rect_for_content_style(
     rect: NSRect,
     style_mask: usize,
 ) -> NSRect {
-    frame_for_content(rect, inset_of(receiver, style_mask, false))
+    frame_for_content(rect, inset_of(receiver, style_mask, false).max(0.0))
 }
 
 thread_local! {
@@ -3142,8 +3145,7 @@ fn apply_style(receiver: Id) {
         return;
     }
     let titled = window.style_mask & style::TITLED != 0;
-    let full_size = window.style_mask & style::FULL_SIZE_CONTENT_VIEW != 0;
-    sdl3::video::set_window_bordered(sdl, titled && !draws_own_titlebar() && !full_size);
+    sdl3::video::set_window_bordered(sdl, titled && !draws_own_titlebar());
     sdl3::video::set_window_always_on_top(sdl, window.level >= window_level::FLOATING);
     refit_inset(receiver);
     // The resizable bit is the one that is not simply followed once the
@@ -5298,7 +5300,7 @@ mod tests {
         let inset = content_inset(object);
         assert_eq!(
             inset,
-            crate::decor::inset_for(crate::decor::config(), true, false, false, draws_own_titlebar())
+            crate::decor::inset_for(crate::decor::config(), true, false, false)
         );
         // SAFETY: a window this test made.
         let sdl = unsafe { sdl_window(object) };
