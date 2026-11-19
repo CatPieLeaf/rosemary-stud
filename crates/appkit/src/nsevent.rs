@@ -479,6 +479,54 @@ unsafe extern "C" fn other_event(
     event
 }
 
+/// `+[NSEvent mouseEventWithType:location:modifierFlags:timestamp:
+/// windowNumber:context:eventNumber:clickCount:pressure:]`.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn mouse_event(
+    class: Id,
+    sel: Sel,
+    kind: u64,
+    location: NSPoint,
+    modifiers: u64,
+    timestamp: CGFloat,
+    window_number: isize,
+    context: Id,
+    _event_number: isize,
+    clicks: isize,
+    _pressure: f32,
+) -> Id {
+    let event = unsafe {
+        enter_exit_event(
+            class,
+            sel,
+            kind,
+            location,
+            modifiers,
+            timestamp,
+            window_number,
+            context,
+            0,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if !event.is_null() {
+        // NSEventType: left 1, 2, 6; right 3, 4, 7; other 25, 26, 27.
+        let button = match kind {
+            3 | 4 | 7 => 1,
+            25..=27 => 2,
+            _ => 0,
+        };
+        // SAFETY: as in `other_event`, an allocation of this module still alive.
+        let event = event as *mut Event;
+        unsafe {
+            (*event).button = button;
+            (*event).clicks = clicks as i64;
+        }
+    }
+    event
+}
+
 /// `-CGEvent`: a CoreGraphics event with this one's type, flags and key.
 unsafe extern "C" fn cg_event(receiver: Id, _sel: Sel) -> *const c_void {
     // SAFETY: null or a live object this runtime allocated.
@@ -582,6 +630,8 @@ pub(crate) fn install() {
             => enter_exit_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80^v88";
         "otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"
             => other_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64s72q80q88";
+        "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"
+            => mouse_event, c"@92@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88";
     });
     methods!(class, {
         "type" => kind, c"Q16@0:8";

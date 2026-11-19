@@ -506,12 +506,19 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 crate::screen::forget_recentring();
                 crate::screen::release_relative_pointer(window);
             }
+            if !gained {
+                CLICK_RAISE.with_borrow_mut(|state| state.focus_lost(window));
+            }
             if !object.is_null() && gained {
                 window::set_key_window(object);
                 // A Mac's key window is its front one. A compositor can give
                 // the keyboard before it raises the window, and a game taking
                 // the pointer then takes it under the windows still on top.
-                sdl3::video::raise_window(sdl3::video::window_from_id(window));
+                // Only for focus a click brought: raising on Alt-Tab's passing
+                // focus would take the window back from the one chosen.
+                if CLICK_RAISE.with_borrow_mut(|state| state.focus_gained(window)) {
+                    sdl3::video::raise_window(sdl3::video::window_from_id(window));
+                }
                 // SDL drops relative mouse mode when focus goes, and a window
                 // made while the guest was disassociated never entered it.
                 crate::screen::apply_mouse_association();
@@ -734,6 +741,9 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             x,
             y,
         } => {
+            if down && CLICK_RAISE.with_borrow_mut(|state| state.pressed(id)) {
+                sdl3::video::raise_window(sdl3::video::window_from_id(id));
+            }
             // The point the guest sees: a disassociated pointer's click lands
             // where its cursor froze, not where SDL's integrated position is.
             let (cx, cy) = track_pointer(id, x, y);
@@ -1030,6 +1040,52 @@ fn key_equivalent(window: Id, fields: Fields, text: &str) -> bool {
     let menu = crate::menu::main_menu();
     let event = nsevent::make(fields);
     offer(window, event) || offer(menu, event)
+}
+
+/// Whether keyboard focus came from a click on the window, which compositors
+/// deliver in either order: a click before the focus, or the focus first.
+#[derive(Default)]
+struct ClickRaise {
+    focused: Option<u32>,
+    clicked: Option<u32>,
+    focused_awaiting_click: Option<u32>,
+}
+
+impl ClickRaise {
+    /// True when a click on this window came before its focus.
+    fn focus_gained(&mut self, window: u32) -> bool {
+        self.focused = Some(window);
+        if self.clicked.take() == Some(window) {
+            return true;
+        }
+        self.focused_awaiting_click = Some(window);
+        false
+    }
+
+    fn focus_lost(&mut self, window: u32) {
+        if self.focused == Some(window) {
+            self.focused = None;
+        }
+        if self.focused_awaiting_click == Some(window) {
+            self.focused_awaiting_click = None;
+        }
+    }
+
+    /// True when this press completes a focus that arrived first.
+    fn pressed(&mut self, window: u32) -> bool {
+        if self.focused_awaiting_click == Some(window) {
+            self.focused_awaiting_click = None;
+            return true;
+        }
+        if self.focused != Some(window) {
+            self.clicked = Some(window);
+        }
+        false
+    }
+}
+
+thread_local! {
+    static CLICK_RAISE: std::cell::RefCell<ClickRaise> = std::cell::RefCell::new(ClickRaise::default());
 }
 
 // Only the physical SDL container receives host mouse input. Mouse-downs
