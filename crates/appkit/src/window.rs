@@ -150,6 +150,7 @@ mod style {
     /// `NSWindowStyleMaskFullScreen`, which AppKit sets and clears itself;
     /// see `style_mask`.
     pub const FULL_SCREEN: usize = 1 << 14;
+    pub const FULL_SIZE_CONTENT_VIEW: usize = 1 << 15;
 }
 
 /// The `NSWindowLevel`s that say what a window is *for*.
@@ -852,11 +853,13 @@ pub(crate) fn content_inset(object: Id) -> CGFloat {
 }
 
 fn inset_of(object: Id, style_mask: usize, fullscreen: bool) -> CGFloat {
+    // A full-size content view starts at the window's top, under the titlebar.
     crate::decor::inset_for(
         crate::decor::config(),
         style_mask & style::TITLED != 0,
         is_panel(object),
         fullscreen,
+        draws_own_titlebar() && style_mask & style::FULL_SIZE_CONTENT_VIEW == 0,
     )
 }
 
@@ -1253,6 +1256,7 @@ pub(crate) fn facts(object: Id) -> Option<crate::decor::Facts> {
             .into_owned(),
         title_hidden: window.title_visibility == 1,
         // A transparent titlebar shows the window behind it.
+        full_size: mask & style::FULL_SIZE_CONTENT_VIEW != 0,
         titlebar_color: (window.titlebar_transparent != 0).then(|| {
             let (r, g, b, a) = background_rgba(object);
             let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -3138,7 +3142,8 @@ fn apply_style(receiver: Id) {
         return;
     }
     let titled = window.style_mask & style::TITLED != 0;
-    sdl3::video::set_window_bordered(sdl, titled && !draws_own_titlebar());
+    let full_size = window.style_mask & style::FULL_SIZE_CONTENT_VIEW != 0;
+    sdl3::video::set_window_bordered(sdl, titled && !draws_own_titlebar() && !full_size);
     sdl3::video::set_window_always_on_top(sdl, window.level >= window_level::FLOATING);
     refit_inset(receiver);
     // The resizable bit is the one that is not simply followed once the
@@ -5293,7 +5298,7 @@ mod tests {
         let inset = content_inset(object);
         assert_eq!(
             inset,
-            crate::decor::inset_for(crate::decor::config(), true, false, false)
+            crate::decor::inset_for(crate::decor::config(), true, false, false, draws_own_titlebar())
         );
         // SAFETY: a window this test made.
         let sdl = unsafe { sdl_window(object) };
