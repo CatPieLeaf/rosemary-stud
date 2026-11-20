@@ -86,6 +86,10 @@ libmimalloc-sys = { path = "third_party/libmimalloc-sys" }
 # rust-fontconfig's mmapio, ported to FreeBSD (no MAP_LOCKED there).
 mmapio = { git = "https://github.com/microlift/mmapio" }
 
+[profile.release]
+lto = true
+codegen-units = 1
+
 [profile.fullnative]
 inherits = "release"
 lto = true
