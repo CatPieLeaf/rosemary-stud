@@ -15,7 +15,7 @@ the host, or vendored. Vendored files are copied to `lib/`, their RUNPATH
 rewritten to `$ORIGIN`, so no Nix store path is needed at run time. A report,
 `share/doc/rosemary/SOURCES.yaml`, says where every file came from.
 
-Executables can be vendored too (`executables`), such as WebKitGTK's helper
+Executables can be vendored too (`executables`), such as WPE WebKit's helper
 processes: they get the host's loader as their interpreter and a RUNPATH that
 reaches `lib/`. Libraries that are loaded by path, not soname, such as GIO
 modules, go where `extra_libraries` says.

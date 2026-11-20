@@ -67,13 +67,13 @@ use super::{Command, Composition, Event, Frame, Monitor, Shared, SurfaceId, lock
 const DEFAULT_REFRESH: u32 = 60_000;
 
 /// How long an output no window is on stays, so that a window moving back
-/// and forth between displays does not make GTK remake its monitors.
+/// and forth between displays does not make WPE remake its screens.
 const OUTPUT_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a toplevel may go without a view claiming it before it is closed.
 const UNCLAIMED_GRACE: Duration = Duration::from_secs(3);
 
-/// The text types asked of a selection GTK sets, most preferred first; the
+/// The text types asked of a selection WPE sets, most preferred first; the
 /// first one it offers is read.
 const TEXT_TYPES: &[&str] = &["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 const HTML_TYPE: &str = "text/html";
@@ -106,14 +106,12 @@ struct Window {
     dirty: bool,
     created: Instant,
     closed: bool,
-    /// Whether its title has been reported as naming a view.
-    named: bool,
 }
 
 /// An output standing for one host display at one mode and scale. A display
 /// whose mode changes gets a new one, rather than the old one changing: a
-/// GTK monitor's refresh rate is read once, when WebKit starts pacing a page
-/// for it, and only moving to another monitor makes it read it again.
+/// client may read a screen's refresh rate only once, when it starts pacing
+/// a page for it, and only moving to another screen makes it read it again.
 struct Shown {
     id: u64,
     monitor: Monitor,
@@ -235,7 +233,7 @@ fn start(
                     .display
                     .insert_client(stream, Arc::new(ClientState::default()))
                 {
-                    eprintln!("rosemary: webkit: compositor: GTK could not connect: {why}");
+                    eprintln!("rosemary: webkit: compositor: WPE could not connect: {why}");
                     return Ok(PostAction::Continue);
                 }
                 // One client, and nobody else should find the socket.
@@ -380,7 +378,7 @@ impl State {
         self.start.elapsed().as_millis() as u32
     }
 
-    /// Publish what changed and get it to GTK.
+    /// Publish what changed and get it to WPE.
     fn after_dispatch(&mut self) {
         self.popups.cleanup();
         let mut published = false;
@@ -458,7 +456,7 @@ impl State {
                         let changed = window.configure != Some(configure);
                         if changed {
                             // Pictures of the other kind are wanted now, and
-                            // GTK may not draw again for a while.
+                            // WPE may not draw again for a while.
                             if window.configure.is_some_and(|c| c.dmabuf != dmabuf) {
                                 window.dirty = true;
                             }
@@ -586,8 +584,8 @@ impl State {
         let configure = entry.configure;
         let toplevel = entry.toplevel.clone();
         toplevel.with_pending_state(|state| {
-            // Maximized and tiled on every edge: GTK then takes the size it is
-            // given exactly and draws no shadow around it.
+            // Maximized and tiled on every edge: the client then takes the size
+            // it is given exactly.
             for fixed in [
                 xdg_toplevel::State::Maximized,
                 xdg_toplevel::State::TiledLeft,
@@ -702,7 +700,7 @@ impl State {
         self.focus_keyboard();
     }
 
-    /// Close the toplevels no view has claimed: a dialog GTK opened that no
+    /// Close the toplevels no view has claimed: a toplevel WPE opened that no
     /// window here would ever show.
     fn close_unclaimed(&mut self) {
         for window in self.windows.values_mut() {
@@ -718,7 +716,7 @@ impl State {
                 })
                 .unwrap_or_default();
                 eprintln!(
-                    "rosemary: webkit: closing GTK window {title:?}, which no web view shows"
+                    "rosemary: webkit: closing WPE toplevel {title:?}, which no web view shows"
                 );
                 window.closed = true;
                 window.toplevel.send_close();
@@ -822,8 +820,8 @@ impl State {
                 .find(|shown| shown.id == id)
                 .map(|shown| shown.output.clone()),
         };
-        // Entered before the old one is left, so that GTK never sees the
-        // window on no monitor at all.
+        // Entered before the old one is left, so that WPE never sees the
+        // view on no screen at all.
         if let Some(new) = output_of(Some(id)) {
             for surface in &surfaces {
                 new.enter(surface);
@@ -898,7 +896,7 @@ impl State {
     }
 
     /// Withdraw the outputs no window is on, and destroy them a while later,
-    /// once GTK has had time to stop using them.
+    /// once WPE has had time to stop using them.
     fn retire_outputs(&mut self) {
         let unused: Vec<u64> = self
             .outputs
@@ -922,7 +920,7 @@ impl State {
         }
     }
 
-    /// Read the selection GTK just set, in `types`, off this thread.
+    /// Read the selection WPE just set, in `types`, off this thread.
     fn read_selection(&mut self, seat: &Seat<State>, types: Vec<String>) {
         let mut reads = Vec::new();
         for ty in types {
@@ -938,9 +936,9 @@ impl State {
         }
         let _ = self.display.flush_clients();
         let shared = self.shared.clone();
-        // GTK writes the contents from its own thread once it sees the
-        // request, so they are read on another thread than this one, which has
-        // to keep serving GTK meanwhile.
+        // WPE writes the contents only once it sees the request, so they are
+        // read on another thread than this one, which has to keep serving WPE
+        // meanwhile.
         std::thread::spawn(move || {
             let entries: Vec<(String, Vec<u8>)> = reads
                 .into_iter()
@@ -1236,31 +1234,10 @@ impl CompositorHandler for State {
             && let Some(entry) = self.windows.get_mut(&window)
         {
             entry.dirty = true;
-            if !entry.named {
-                let title = with_states(entry.toplevel.wl_surface(), |states| {
-                    states
-                        .data_map
-                        .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
-                        .and_then(|data| data.lock().ok()?.title.clone())
-                })
-                .unwrap_or_default();
-                if title.starts_with(NAMED_PREFIX) {
-                    entry.named = true;
-                    lock(&self.shared.events).push(Event::Named {
-                        surface: window,
-                        title,
-                    });
-                    (self.shared.wake)();
-                }
-            }
             self.arm_frames(window);
         }
     }
 }
-
-/// The title the web view host's helper gives each window: the prefix, then
-/// the view's id.
-pub(crate) const NAMED_PREFIX: &str = "stud-view-";
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -1285,7 +1262,6 @@ impl XdgShellHandler for State {
                 dirty: false,
                 created: Instant::now(),
                 closed: false,
-                named: false,
             },
         );
         self.place(window);
@@ -1371,7 +1347,7 @@ impl SeatHandler for State {
         let name = match image {
             CursorImageStatus::Hidden => None,
             CursorImageStatus::Named(icon) => Some(icon.name()),
-            // A cursor GTK draws itself; the nearest thing is the arrow.
+            // A cursor WPE draws itself; the nearest thing is the arrow.
             CursorImageStatus::Surface(_) => Some("default"),
         };
         lock(&self.shared.events).push(Event::Cursor { surface, name });
@@ -1395,7 +1371,7 @@ impl SelectionHandler for State {
         };
         let offered = source.mime_types();
         if crate::engine::tracing() {
-            eprintln!("rosemary: webkit: compositor: GTK offers {offered:?}");
+            eprintln!("rosemary: webkit: compositor: WPE offers {offered:?}");
         }
         let text = TEXT_TYPES
             .iter()
@@ -1427,7 +1403,7 @@ impl SelectionHandler for State {
         else {
             return;
         };
-        // GTK reads on its own thread; a large paste would fill the pipe and
+        // WPE reads on its own thread; a large paste would fill the pipe and
         // stall this one.
         std::thread::spawn(move || {
             let _ = std::fs::File::from(fd).write_all(&bytes);

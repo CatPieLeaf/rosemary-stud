@@ -1,4 +1,4 @@
-//! The compositor driven by a real Wayland client, as GTK drives it.
+//! The compositor driven by a real Wayland client, as WPE drives it.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};

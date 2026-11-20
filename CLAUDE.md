@@ -60,7 +60,7 @@ All members live in `crates/*` (see `Cargo.toml` for the full member/dependency 
   `std`-free; verify with `cargo check -p machish --no-default-features`.
 * **Darwin/framework crates** — `darwin` (Darwin syscalls/POSIX shims), `objc` (Objective-C runtime, used by both
   `native` and `builtin` modes), `corefoundation`, `foundation`, `appkit`, `applicationservices`, `audiotoolbox`,
-  `coreaudio`, `corevideo`, `contacts`, `security`, `iokit`, `gamecontroller`, `forcefeedback`, `webkit` (WebKitGTK
+  `coreaudio`, `corevideo`, `contacts`, `security`, `iokit`, `gamecontroller`, `forcefeedback`, `webkit` (WPE WebKit
   behind a private Wayland compositor). These are cross-platform reimplementations of Apple
   frameworks; platform-specific behavior belongs here, not scattered through the runtime crate.
 * **`server`** — the per-prefix process server (Rosemary's `wineserver`): which pids are guests, their

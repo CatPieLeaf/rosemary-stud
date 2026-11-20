@@ -1,11 +1,8 @@
 //! The host's DRM connectors, read to give each output the physical size of
 //! the display it stands for.
 //!
-//! WebKitGTK paces `requestAnimationFrame` with a vblank monitor that finds
-//! its display's CRTC by comparing the `GdkMonitor`'s physical size with each
-//! connected connector's. An output with the real size lets it wait on the
-//! real vblank at the real rate; one it cannot match leaves it on a timer
-//! fixed at 60 Hz.
+//! WPE takes each screen's physical size and refresh rate from its output,
+//! and paces the pages shown on it by them.
 
 use std::os::fd::{AsFd, BorrowedFd};
 

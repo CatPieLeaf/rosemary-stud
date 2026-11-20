@@ -5,13 +5,15 @@ use std::sync::OnceLock;
 use objc::object::Id;
 
 use crate::compositor::{Composition, Compositor};
-use crate::gtk::{self, Api, Ptr};
+use crate::wpe::{self, Api, Ptr};
 
 pub struct Engine {
     pub api: &'static Api,
-    /// Where GTK's windows are shown: every view's pictures and input go
+    /// Where WPE's views are shown: every view's pictures and input go
     /// through it.
     pub compositor: Compositor,
+    /// The `WPEDisplay` on the compositor that every view is made on.
+    pub display: usize,
     /// The `WebKitNetworkSession` every view shares, as every `WKWebView` with
     /// the default data store shares one cookie jar.
     pub session: usize,
@@ -20,23 +22,9 @@ pub struct Engine {
 
 static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 
-/// The compositor the pages are shown in: WebKitGTK's own, or with the web
-/// view host's helper (`STUD_WEBVIEW_HELPER`), the one its QtWebEngine windows
-/// live in. `None` where neither runs.
-pub fn compositor() -> Option<&'static Compositor> {
-    if crate::remote::requested() {
-        return crate::remote::compositor();
-    }
-    get().map(|engine| &engine.compositor)
-}
-
-/// The engine, started on first use; `None` where WebKitGTK is missing or
+/// The engine, started on first use; `None` where WPE WebKit is missing or
 /// cannot open a display, or on a thread other than the one it runs on.
 pub fn get() -> Option<&'static Engine> {
-    // The web view host shows every page; WebKitGTK is not started beside it.
-    if crate::remote::requested() {
-        return None;
-    }
     let engine = ENGINE.get_or_init(|| {
         let started = start();
         if let Err(why) = &started {
@@ -46,7 +34,7 @@ pub fn get() -> Option<&'static Engine> {
     });
     let engine = engine.as_ref().ok()?;
     if engine.thread != darwin::pthread::id() {
-        warn_once("a web view was used off the thread WebKitGTK runs on; ignored");
+        warn_once("a web view was used off the thread WPE WebKit runs on; ignored");
         return None;
     }
     Some(engine)
@@ -62,60 +50,26 @@ fn start() -> Result<Engine, String> {
     if std::env::var_os("ROSEMARY_WEBKIT").is_some_and(|value| value == "0") {
         return Err("disabled by ROSEMARY_WEBKIT=0".to_string());
     }
-    if appkit::decor::config().decorations == appkit::decor::Decorations::Server
-        && std::env::var_os("WAYLAND_DISPLAY").is_some()
-    {
-        // SDL may have loaded libdecor's GTK 3 plugin for the host titlebar,
-        // and GTK 3 and the GTK 4 loaded next cannot share a process.
-        warn_once(
-            "ROSEMARY_DECORATIONS=server lets libdecor load GTK 3 next to \
-             WebKit's GTK 4; if the program crashes, use the default client decorations",
-        );
-    }
-    let api = gtk::api()?;
-    let mode = std::env::var("ROSEMARY_WEBKIT_GPU").unwrap_or("gtk".into());
-    let composition = match mode.as_str() {
-        "0" => Composition::Cpu,
+    let api = wpe::api()?;
+    let composition = match std::env::var("ROSEMARY_WEBKIT_GPU").as_deref() {
+        Ok("0") => Composition::Cpu,
         _ => Composition::Gpu(appkit::backing::importer()),
     };
     let compositor = Compositor::start(wake, composition)?;
-    // GTK would otherwise call `setlocale(LC_ALL, "")`, which changes how the
-    // host's C library formats numbers under the guest's feet.
-    // SAFETY: safe to call before anything else in GTK.
-    unsafe { (api.gtk_disable_setlocale)() };
-    // GTK's display is the compositor, never the host's. GTK opens its
-    // display in `gtk_init` from the environment alone, and refuses to have
-    // one opened for it earlier, so the environment says where the compositor
-    // is for that one call. The guest reads its own copy of the environment,
-    // which this does not touch.
-    let socket = compositor.socket.clone();
-    let mut variables = vec![
-        ("WAYLAND_DISPLAY", socket.as_os_str()),
-        ("GDK_BACKEND", std::ffi::OsStr::new("wayland")),
-    ];
-    // GTK draws with cairo unless asked: its GPU renderers take WebKit's
-    // pages as dma-bufs, and that costs a page a frame of latency - about 70
-    // frames a second where cairo keeps up with 110 on a 144 Hz display.
-    // Without a GPU compositor they could only run in software anyway.
-    if !compositor.gpu || mode != "gtk" {
-        variables.push(("GDK_DISABLE", std::ffi::OsStr::new("gl,vulkan")));
+    // WPE's display is the compositor, never the host's.
+    let socket = wpe::c_string(&compositor.socket.to_string_lossy());
+    // SAFETY: a new display, and the compositor's socket path, which it copies.
+    let display = unsafe { (api.wpe_display_wayland_new)() };
+    let mut error = std::ptr::null_mut();
+    let connected =
+        unsafe { (api.wpe_display_wayland_connect)(display, socket.as_ptr(), &mut error) } != 0;
+    // SAFETY: the error the call above may have set.
+    if let Some((_, why)) = unsafe { wpe::take_error(api, error) } {
+        return Err(format!("WPE could not connect to the web view compositor: {why}"));
     }
-    let started = with_environment(
-        &variables,
-        // SAFETY: both are safe to call before anything else in GTK.
-        || unsafe {
-            (api.gdk_set_allowed_backends)(c"wayland".as_ptr());
-            (api.gtk_init_check)() != 0
-        },
-    );
-    if !started {
-        return Err("GTK could not connect to the web view compositor".to_string());
+    if !connected {
+        return Err("WPE could not connect to the web view compositor".to_string());
     }
-    // SAFETY: the display manager GTK just set up.
-    let display =
-        unsafe { (api.gdk_display_manager_get_default_display)((api.gdk_display_manager_get)()) };
-    // SAFETY: the display GTK now runs on.
-    unsafe { gtk::make_windows_transparent(api, display) };
     let identifier = foundation::bundle::main()
         .and_then(|bundle| bundle.identifier())
         .unwrap_or("rosemary")
@@ -123,50 +77,25 @@ fn start() -> Result<Engine, String> {
     let home = foundation::host_home_directory();
     let data = home.join("Library/WebKit").join(&identifier);
     let cache = home.join("Library/Caches").join(&identifier).join("WebKit");
-    let data = gtk::c_string(&data.to_string_lossy());
-    let cache = gtk::c_string(&cache.to_string_lossy());
+    let data = wpe::c_string(&data.to_string_lossy());
+    let cache = wpe::c_string(&cache.to_string_lossy());
     // SAFETY: two NUL-terminated paths, which the session copies.
     let session = unsafe { (api.webkit_network_session_new)(data.as_ptr(), cache.as_ptr()) };
     if session.is_null() {
-        return Err("WebKitGTK made no network session".to_string());
+        return Err("WPE WebKit made no network session".to_string());
     }
     appkit::event::add_pump_hook(pump);
     Ok(Engine {
         api,
         compositor,
+        display: display as usize,
         session: session as usize,
         thread: darwin::pthread::id(),
     })
 }
 
-/// Run `f` with `variables` set in the host's environment, then put back
-/// what was there.
-fn with_environment<T>(variables: &[(&str, &std::ffi::OsStr)], f: impl FnOnce() -> T) -> T {
-    let saved: Vec<_> = variables
-        .iter()
-        .map(|(name, _)| (*name, std::env::var_os(name)))
-        .collect();
-    for (name, value) in variables {
-        // SAFETY: not strictly - another host thread could be reading the
-        // environment. The window is one `gtk_init` long, at the first web
-        // view, and no other host code reads these two variables.
-        unsafe { std::env::set_var(name, value) };
-    }
-    let result = f();
-    for (name, value) in saved {
-        // SAFETY: as above.
-        unsafe {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-    result
-}
-
 /// Get the main thread to the pump, from the compositor's thread.
-pub(crate) fn wake() {
+fn wake() {
     corefoundation::runloop::main().wake();
 }
 
@@ -197,14 +126,6 @@ pub fn defer(work: impl FnOnce() + 'static) {
     DEFERRED.with(|deferred| deferred.borrow_mut().push(Box::new(work)));
 }
 
-/// Run the work `defer` queued, for a pump other than WebKitGTK's.
-pub fn run_deferred() {
-    let work = DEFERRED.with(|deferred| std::mem::take(&mut *deferred.borrow_mut()));
-    for item in work {
-        item();
-    }
-}
-
 fn pump() {
     let Some(engine) = running() else {
         return;
@@ -213,7 +134,7 @@ fn pump() {
     // Bounded, as `drain_main` is: a context that always has work would
     // otherwise keep the run loop from ever getting back to input and drawing.
     for _ in 0..64 {
-        // SAFETY: the default context, iterated on the thread GTK runs on.
+        // SAFETY: the default context, iterated on the thread WPE runs on.
         if unsafe { (engine.api.g_main_context_iteration)(std::ptr::null_mut(), 0) } == 0 {
             break;
         }
@@ -223,18 +144,16 @@ fn pump() {
         item();
     }
     crate::web_view::tick(engine);
-    restore_guest_gl(engine.api);
+    restore_guest_gl();
     objc::arc::pool_pop(pool);
 }
 
-/// GTK and the embedded compositor bind EGL directly, bypassing SDL's TLS.
-/// Clear both libraries' bookkeeping before restoring the guest's binding;
-/// otherwise SDL may skip the native bind because its cached pointers match.
-fn restore_guest_gl(api: &Api) {
+/// WPE binds EGL directly, bypassing SDL's TLS. Unbind before restoring the
+/// guest's binding; otherwise SDL may skip the native bind because its cached
+/// pointers match.
+fn restore_guest_gl() {
     let context = sdl3::video::gl_current_context();
     let window = sdl3::video::gl_current_window();
-    // SAFETY: called on GTK's thread after its rendering work has returned.
-    unsafe { (api.gdk_gl_context_clear_current)() };
     if !context.is_null() && !sdl3::video::egl::backs(context) {
         sdl3::video::gl_make_current(std::ptr::null_mut(), std::ptr::null_mut());
         if !sdl3::video::gl_make_current(window, context) {
@@ -391,10 +310,9 @@ mod gl_tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires a host EGL driver and WebKitGTK"]
+    #[ignore = "requires a host EGL driver"]
     fn web_rendering_restores_native_gl_even_when_sdl_cached_state_matches() {
         appkit::bootstrap();
-        let api = gtk::api().expect("WebKitGTK");
         let window = sdl3::video::create_window(
             c"GL restoration test",
             2,
@@ -434,7 +352,7 @@ mod gl_tests {
         }
         assert_eq!(sdl3::video::gl_current_context(), guest);
         assert!(sdl3::video::egl::backs(foreign));
-        restore_guest_gl(api);
+        restore_guest_gl();
         assert_eq!(sdl3::video::gl_current_context(), guest);
         assert_eq!(sdl3::video::gl_current_window(), window);
         assert!(sdl3::video::egl::backs(guest));

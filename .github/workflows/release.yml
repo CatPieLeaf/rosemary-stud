@@ -44,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The store, WebKitGTK's closure included, needs more than a stock
+      # The store, WPE WebKit's closure included, needs more than a stock
       # runner leaves free.
       - name: Free disk space
         run: |

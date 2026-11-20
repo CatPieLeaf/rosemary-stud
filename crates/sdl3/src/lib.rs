@@ -5373,9 +5373,8 @@ pub mod video {
     /// visible while relative mouse mode is on. SDL hides it by default.
     pub const HINT_RELATIVE_CURSOR_VISIBLE: &CStr = c"SDL_MOUSE_RELATIVE_CURSOR_VISIBLE";
 
-    /// `SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR`. libdecor's GTK plugin loads
-    /// GTK 3, which cannot share a process with the GTK 4 WebKit uses, so a
-    /// runtime drawing its own decorations turns it off before video starts.
+    /// `SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR`, which a runtime drawing its own
+    /// decorations turns off before video starts.
     pub const HINT_WAYLAND_ALLOW_LIBDECOR: &CStr = c"SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR";
 
     /// `SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED`.

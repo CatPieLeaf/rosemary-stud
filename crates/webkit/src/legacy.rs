@@ -1,11 +1,11 @@
-//! WebKit1's `WebView`, built on the `WKWebView` this crate runs on WebKitGTK.
+//! WebKit1's `WebView`, built on the `WKWebView` this crate runs on WPE WebKit.
 //!
 //! A `WebView` is a `WKWebView` subclass here, so drawing, input and loading
 //! are that class's. What WebKit1 adds is its delegates and its script bridge:
 //! `WebScriptObject`, through which a page calls Objective-C objects a program
 //! put on its `window`, synchronously, and gets their answers back.
 //!
-//! WebKitGTK runs the page in another process and has no synchronous call into
+//! WPE WebKit runs the page in another process and has no synchronous call into
 //! this one - except a script dialog, which blocks the page until it is
 //! answered. So a script injected before the page's own calls `prompt()` with
 //! a marker and a JSON request, and the `script-dialog` handler here answers
@@ -24,7 +24,7 @@ use objc::object::Id;
 use objc::sel::Sel;
 
 use crate::engine;
-use crate::gtk::{self, Ptr};
+use crate::wpe::{self, Ptr};
 use crate::{send, web_view};
 
 /// The message of a bridge prompt; any other prompt is the page's own.
@@ -104,7 +104,7 @@ fn with<R>(object: Id, body: impl FnOnce(&mut Legacy) -> R) -> Option<R> {
     })
 }
 
-/// The `WebView` a WebKitGTK callback is about.
+/// The `WebView` a WPE WebKit callback is about.
 fn view_of(data: Ptr) -> Option<Id> {
     let object = web_view::object_of(data as usize)?;
     with(object, |_| ()).map(|()| object)
@@ -132,14 +132,14 @@ struct ScriptObject {
     view: usize,
 }
 
-/// A `WebPolicyDecisionListener`, holding the GTK decision it answers.
+/// A `WebPolicyDecisionListener`, holding the WebKit decision it answers.
 struct Listener {
     decision: usize,
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        // A decision never answered is released unanswered, which WebKitGTK
+        // A decision never answered is released unanswered, which WPE WebKit
         // takes as "use", as WebKit1 does for a listener dropped undecided.
         if let Some(engine) = engine::get() {
             engine::unref(engine.api, std::mem::take(&mut self.decision));
@@ -215,7 +215,7 @@ unsafe extern "C" fn evaluated(source: Ptr, result: Ptr, data: Ptr) {
     // SAFETY: the view and result this callback was invoked with.
     let value =
         unsafe { (api.webkit_web_view_evaluate_javascript_finish)(source, result, &mut error) };
-    let object = match unsafe { gtk::take_error(api, error) } {
+    let object = match unsafe { wpe::take_error(api, error) } {
         Some((_, message)) => {
             eprintln!("rosemary: webkit: a script native code ran threw: {message}");
             std::ptr::null_mut()
@@ -235,7 +235,7 @@ unsafe extern "C" fn evaluated(source: Ptr, result: Ptr, data: Ptr) {
 /// Evaluate `script` and turn the loop until it answers, as WebKit1's
 /// in-process evaluation returns its value.
 fn evaluate_now(object: Id, script: &str) -> Id {
-    let (Some(engine), Some((_, gtk, _))) = (engine::get(), web_view::parts_of(object)) else {
+    let (Some(engine), Some((_, page, _))) = (engine::get(), web_view::parts_of(object)) else {
         return std::ptr::null_mut();
     };
     let api = engine.api;
@@ -243,12 +243,12 @@ fn evaluate_now(object: Id, script: &str) -> Id {
         done: false,
         value: std::ptr::null_mut(),
     }));
-    let source = gtk::c_string(script);
+    let source = wpe::c_string(script);
     // SAFETY: the view's widget, a script it copies, and a reference the
     // callback takes back.
     unsafe {
         (api.webkit_web_view_evaluate_javascript)(
-            gtk,
+            page,
             source.as_ptr(),
             -1,
             std::ptr::null(),
@@ -260,7 +260,7 @@ fn evaluate_now(object: Id, script: &str) -> Id {
     };
     let deadline = Instant::now() + EVALUATION_TIMEOUT;
     while !slot.borrow().done && Instant::now() < deadline {
-        // SAFETY: the default context, on the thread GTK runs on.
+        // SAFETY: the default context, on the thread WPE runs on.
         if unsafe { (api.g_main_context_iteration)(std::ptr::null_mut(), 0) } == 0 {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -630,9 +630,9 @@ fn handle(object: Id, request: &str) -> String {
     out
 }
 
-// -- WebKitGTK signals ----------------------------------------------------------
+// -- WPE WebKit signals ----------------------------------------------------------
 
-unsafe extern "C" fn script_dialog(_gtk: Ptr, dialog: Ptr, data: Ptr) -> c_int {
+unsafe extern "C" fn script_dialog(_page: Ptr, dialog: Ptr, data: Ptr) -> c_int {
     let (Some(engine), Some(object)) = (engine::get(), view_of(data)) else {
         return 0;
     };
@@ -641,13 +641,13 @@ unsafe extern "C" fn script_dialog(_gtk: Ptr, dialog: Ptr, data: Ptr) -> c_int {
     let (kind, message) = unsafe {
         (
             (api.webkit_script_dialog_get_dialog_type)(dialog),
-            gtk::text((api.webkit_script_dialog_get_message)(dialog)),
+            wpe::text((api.webkit_script_dialog_get_message)(dialog)),
         )
     };
-    if kind == gtk::SCRIPT_DIALOG_PROMPT && message == MAGIC {
+    if kind == wpe::SCRIPT_DIALOG_PROMPT && message == MAGIC {
         let request =
-            unsafe { gtk::text((api.webkit_script_dialog_prompt_get_default_text)(dialog)) };
-        let reply = gtk::c_string(&handle(object, &request));
+            unsafe { wpe::text((api.webkit_script_dialog_prompt_get_default_text)(dialog)) };
+        let reply = wpe::c_string(&handle(object, &request));
         // SAFETY: a prompt dialog, and text it copies.
         unsafe { (api.webkit_script_dialog_prompt_set_text)(dialog, reply.as_ptr()) };
         return 1;
@@ -660,7 +660,7 @@ unsafe extern "C" fn script_dialog(_gtk: Ptr, dialog: Ptr, data: Ptr) -> c_int {
     // SAFETY: the delegate answers each selector, with these prototypes.
     unsafe {
         match kind {
-            gtk::SCRIPT_DIALOG_ALERT
+            wpe::SCRIPT_DIALOG_ALERT
                 if engine::responds(
                     ui,
                     "webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:",
@@ -669,7 +669,7 @@ unsafe extern "C" fn script_dialog(_gtk: Ptr, dialog: Ptr, data: Ptr) -> c_int {
                 send!(ui, "webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:",
                     object => Id, text => Id, frame => Id; ());
             }
-            gtk::SCRIPT_DIALOG_CONFIRM => {
+            wpe::SCRIPT_DIALOG_CONFIRM => {
                 let confirmed = engine::responds(
                     ui,
                     "webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:",
@@ -678,18 +678,18 @@ unsafe extern "C" fn script_dialog(_gtk: Ptr, dialog: Ptr, data: Ptr) -> c_int {
                     != 0;
                 (api.webkit_script_dialog_confirm_set_confirmed)(dialog, c_int::from(confirmed));
             }
-            gtk::SCRIPT_DIALOG_PROMPT => {
+            wpe::SCRIPT_DIALOG_PROMPT => {
                 const SELECTOR: &str =
                     "webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:";
                 if engine::responds(ui, SELECTOR) {
-                    let default = engine::string(&gtk::text((api
+                    let default = engine::string(&wpe::text((api
                         .webkit_script_dialog_prompt_get_default_text)(
                         dialog
                     )));
                     let answer = send!(ui, "webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:",
                         object => Id, text => Id, default => Id, frame => Id; Id);
                     if !answer.is_null() {
-                        let answer = gtk::c_string(&engine::text_of(answer));
+                        let answer = wpe::c_string(&engine::text_of(answer));
                         (api.webkit_script_dialog_prompt_set_text)(dialog, answer.as_ptr());
                     }
                 }
@@ -700,14 +700,14 @@ unsafe extern "C" fn script_dialog(_gtk: Ptr, dialog: Ptr, data: Ptr) -> c_int {
     1
 }
 
-unsafe extern "C" fn load_changed(_gtk: Ptr, event: c_int, data: Ptr) {
+unsafe extern "C" fn load_changed(_page: Ptr, event: c_int, data: Ptr) {
     let Some(object) = view_of(data) else {
         return;
     };
     let selector = match event {
-        gtk::LOAD_STARTED => "webView:didStartProvisionalLoadForFrame:",
-        gtk::LOAD_COMMITTED => "webView:didCommitLoadForFrame:",
-        gtk::LOAD_FINISHED => "webView:didFinishLoadForFrame:",
+        wpe::LOAD_STARTED => "webView:didStartProvisionalLoadForFrame:",
+        wpe::LOAD_COMMITTED => "webView:didCommitLoadForFrame:",
+        wpe::LOAD_FINISHED => "webView:didFinishLoadForFrame:",
         _ => return,
     };
     let delegate = field(object, |v| v.frame_load);
@@ -723,16 +723,16 @@ unsafe extern "C" fn load_changed(_gtk: Ptr, event: c_int, data: Ptr) {
 }
 
 unsafe extern "C" fn load_failed(
-    _gtk: Ptr,
+    _page: Ptr,
     event: c_int,
     uri: *const std::ffi::c_char,
-    error: *mut gtk::GError,
+    error: *mut wpe::GError,
     data: Ptr,
 ) -> c_int {
     let Some(object) = view_of(data) else {
         return 0;
     };
-    let selector = match event < gtk::LOAD_COMMITTED {
+    let selector = match event < wpe::LOAD_COMMITTED {
         true => "webView:didFailProvisionalLoadWithError:forFrame:",
         false => "webView:didFailLoadWithError:forFrame:",
     };
@@ -744,10 +744,10 @@ unsafe extern "C" fn load_failed(
     let (code, message) = unsafe {
         match error.is_null() {
             true => (0, String::new()),
-            false => ((*error).code, gtk::text((*error).message)),
+            false => ((*error).code, wpe::text((*error).message)),
         }
     };
-    let message = format!("{message} ({})", unsafe { gtk::text(uri) });
+    let message = format!("{message} ({})", unsafe { wpe::text(uri) });
     let error = foundation::error::make("WebKitErrorDomain", i64::from(code), &message);
     let frame = field(object, |v| v.main_frame);
     // SAFETY: the delegate answers the selector, `void (id, SEL, id, id, id)`.
@@ -758,15 +758,15 @@ unsafe extern "C" fn load_failed(
     0
 }
 
-unsafe extern "C" fn decide_policy(_gtk: Ptr, decision: Ptr, kind: c_int, data: Ptr) -> c_int {
+unsafe extern "C" fn decide_policy(_page: Ptr, decision: Ptr, kind: c_int, data: Ptr) -> c_int {
     let (Some(engine), Some(object)) = (engine::get(), view_of(data)) else {
         return 0;
     };
     let selector = match kind {
-        gtk::POLICY_DECISION_NAVIGATION_ACTION => {
+        wpe::POLICY_DECISION_NAVIGATION_ACTION => {
             "webView:decidePolicyForNavigationAction:request:frame:decisionListener:"
         }
-        gtk::POLICY_DECISION_NEW_WINDOW_ACTION => {
+        wpe::POLICY_DECISION_NEW_WINDOW_ACTION => {
             "webView:decidePolicyForNewWindowAction:request:newFrameName:decisionListener:"
         }
         _ => return 0,
@@ -781,11 +781,11 @@ unsafe extern "C" fn decide_policy(_gtk: Ptr, decision: Ptr, kind: c_int, data: 
         let action = (api.webkit_navigation_policy_decision_get_navigation_action)(decision);
         let request = (api.webkit_navigation_action_get_request)(action);
         (
-            gtk::text((api.webkit_uri_request_get_uri)(request)),
+            wpe::text((api.webkit_uri_request_get_uri)(request)),
             (api.webkit_navigation_action_get_navigation_type)(action),
         )
     };
-    // WebKitGTK's navigation types are WebKit1's, in the same order.
+    // WPE WebKit's navigation types are WebKit1's, in the same order.
     let url = web_view::guest_url(&url);
     let information = action_information(&url, navigation_type);
     let request = foundation::urlsession::request_for(&url);
@@ -797,7 +797,7 @@ unsafe extern "C" fn decide_policy(_gtk: Ptr, decision: Ptr, kind: c_int, data: 
         },
     ));
     let third = match kind {
-        gtk::POLICY_DECISION_NAVIGATION_ACTION => field(object, |v| v.main_frame),
+        wpe::POLICY_DECISION_NAVIGATION_ACTION => field(object, |v| v.main_frame),
         _ => std::ptr::null_mut(),
     };
     if engine::tracing() {
@@ -892,7 +892,7 @@ fn set_up(object: Id) {
             draws_background: true,
         })
     });
-    let (Some(engine), Some((id, gtk, configuration))) =
+    let (Some(engine), Some((id, page, configuration))) =
         (engine::get(), web_view::parts_of(object))
     else {
         return;
@@ -903,11 +903,11 @@ fn set_up(object: Id) {
     unsafe {
         let controller = crate::configuration::controller_of(configuration);
         let manager = crate::configuration::manager(controller, engine);
-        let source = gtk::c_string(HELPER);
+        let source = wpe::c_string(HELPER);
         let script = (api.webkit_user_script_new)(
             source.as_ptr(),
-            gtk::USER_CONTENT_INJECT_TOP_FRAME,
-            gtk::USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+            wpe::USER_CONTENT_INJECT_TOP_FRAME,
+            wpe::USER_SCRIPT_INJECT_AT_DOCUMENT_START,
             std::ptr::null(),
             std::ptr::null(),
         );
@@ -919,22 +919,22 @@ fn set_up(object: Id) {
     // interface does to import its own parts.
     // SAFETY: the view's own settings.
     unsafe {
-        let settings = (api.webkit_web_view_get_settings)(gtk);
+        let settings = (api.webkit_web_view_get_settings)(page);
         (api.webkit_settings_set_allow_file_access_from_file_urls)(settings, 1);
         (api.webkit_settings_set_allow_universal_access_from_file_urls)(settings, 1);
     }
     web_view::connect(
         engine,
-        gtk,
+        page,
         c"script-dialog",
         script_dialog as *const (),
         id,
     );
-    web_view::connect(engine, gtk, c"load-changed", load_changed as *const (), id);
-    web_view::connect(engine, gtk, c"load-failed", load_failed as *const (), id);
+    web_view::connect(engine, page, c"load-changed", load_changed as *const (), id);
+    web_view::connect(engine, page, c"load-failed", load_failed as *const (), id);
     web_view::connect(
         engine,
-        gtk,
+        page,
         c"decide-policy",
         decide_policy as *const (),
         id,
@@ -1100,14 +1100,14 @@ unsafe extern "C" fn draws_background(receiver: Id, _sel: Sel) -> u8 {
 }
 
 unsafe extern "C" fn set_application_name(receiver: Id, _sel: Sel, name: Id) {
-    // A header value is printable ASCII; WebKitGTK refuses a whole agent with
+    // A header value is printable ASCII; WPE WebKit refuses a whole agent with
     // anything else in it, such as a trademark sign in a product name.
     let name: String = engine::text_of(name)
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .collect();
     with(receiver, |v| v.application_name = name.clone());
-    let (Some(engine), Some((_, gtk, _))) = (engine::get(), web_view::parts_of(receiver)) else {
+    let (Some(engine), Some((_, page, _))) = (engine::get(), web_view::parts_of(receiver)) else {
         return;
     };
     let agent = match name.is_empty() {
@@ -1117,10 +1117,10 @@ unsafe extern "C" fn set_application_name(receiver: Id, _sel: Sel, name: Id) {
     if engine::tracing() {
         eprintln!("rosemary: webkit: user agent {agent}");
     }
-    let agent = gtk::c_string(&agent);
+    let agent = wpe::c_string(&agent);
     // SAFETY: the view's own settings, and a string they copy.
     unsafe {
-        let settings = (engine.api.webkit_web_view_get_settings)(gtk);
+        let settings = (engine.api.webkit_web_view_get_settings)(page);
         (engine.api.webkit_settings_set_user_agent)(settings, agent.as_ptr());
     }
 }
@@ -1147,9 +1147,9 @@ unsafe extern "C" fn set_preferences(receiver: Id, _sel: Sel, preferences: Id) {
 }
 
 unsafe extern "C" fn reload(receiver: Id, _sel: Sel, _sender: Id) {
-    if let (Some(engine), Some((_, gtk, _))) = (engine::get(), web_view::parts_of(receiver)) {
+    if let (Some(engine), Some((_, page, _))) = (engine::get(), web_view::parts_of(receiver)) {
         // SAFETY: the view's widget.
-        unsafe { (engine.api.webkit_web_view_reload)(gtk) };
+        unsafe { (engine.api.webkit_web_view_reload)(page) };
     }
 }
 
@@ -1159,11 +1159,11 @@ unsafe extern "C" fn stop_loading_sender(receiver: Id, _sel: Sel, _sender: Id) {
 }
 
 unsafe extern "C" fn main_frame_title(receiver: Id, _sel: Sel) -> Id {
-    let (Some(engine), Some((_, gtk, _))) = (engine::get(), web_view::parts_of(receiver)) else {
+    let (Some(engine), Some((_, page, _))) = (engine::get(), web_view::parts_of(receiver)) else {
         return engine::string("");
     };
     // SAFETY: the view's widget; the title is its own.
-    engine::string(&unsafe { gtk::text((engine.api.webkit_web_view_get_title)(gtk)) })
+    engine::string(&unsafe { wpe::text((engine.api.webkit_web_view_get_title)(page)) })
 }
 
 unsafe extern "C" fn ignored_object(_receiver: Id, _sel: Sel, _value: Id) {}
@@ -1202,7 +1202,7 @@ unsafe extern "C" fn frame_load_request(receiver: Id, _sel: Sel, request: Id) {
 
 unsafe extern "C" fn frame_load_html(receiver: Id, _sel: Sel, html: Id, base: Id) {
     let view = frame_view(receiver);
-    let (Some(engine), Some((_, gtk, _))) = (engine::get(), web_view::parts_of(view)) else {
+    let (Some(engine), Some((_, page, _))) = (engine::get(), web_view::parts_of(view)) else {
         return;
     };
     let base = match base.is_null() {
@@ -1210,10 +1210,10 @@ unsafe extern "C" fn frame_load_html(receiver: Id, _sel: Sel, html: Id, base: Id
         // SAFETY: an `NSURL`.
         false => engine::text_of(unsafe { send!(base, "absoluteString"; Id) }),
     };
-    let html = gtk::c_string(&engine::text_of(html));
-    let base = gtk::c_string(&web_view::host_url(&base));
+    let html = wpe::c_string(&engine::text_of(html));
+    let base = wpe::c_string(&web_view::host_url(&base));
     // SAFETY: the view's widget and two strings it copies.
-    unsafe { (engine.api.webkit_web_view_load_html)(gtk, html.as_ptr(), base.as_ptr()) };
+    unsafe { (engine.api.webkit_web_view_load_html)(page, html.as_ptr(), base.as_ptr()) };
 }
 
 unsafe extern "C" fn frame_reload(receiver: Id, sel: Sel) {
@@ -1230,11 +1230,11 @@ unsafe extern "C" fn frame_stop_loading(receiver: Id, _sel: Sel) {
 /// The frame's data source: the document it shows, or is loading.
 unsafe extern "C" fn frame_data_source(receiver: Id, _sel: Sel) -> Id {
     let view = frame_view(receiver);
-    let (Some(engine), Some((_, gtk, _))) = (engine::get(), web_view::parts_of(view)) else {
+    let (Some(engine), Some((_, page, _))) = (engine::get(), web_view::parts_of(view)) else {
         return std::ptr::null_mut();
     };
     // SAFETY: the view's widget; the URI is its own.
-    let url = unsafe { gtk::text((engine.api.webkit_web_view_get_uri)(gtk)) };
+    let url = unsafe { wpe::text((engine.api.webkit_web_view_get_uri)(page)) };
     if url.is_empty() {
         return std::ptr::null_mut();
     }
@@ -1368,7 +1368,7 @@ unsafe extern "C" fn undefined_description(_receiver: Id, _sel: Sel) -> Id {
 
 // -- The policy listener ----------------------------------------------------------
 
-fn decide(receiver: Id, answer: fn(&gtk::Api, Ptr)) {
+fn decide(receiver: Id, answer: fn(&wpe::Api, Ptr)) {
     // SAFETY: a listener, or anything else, which answers `None`.
     let Some(listener) = (unsafe { boxed::contents::<Listener>(receiver, listener_class()) })
     else {

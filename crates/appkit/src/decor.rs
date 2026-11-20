@@ -113,9 +113,7 @@ fn follow_system_theme() -> bool {
 /// Set what has to be decided before SDL's video subsystem starts.
 pub(crate) fn install() {
     if config().decorations == Decorations::Client {
-        // libdecor's GTK plugin loads GTK 3 into the process, which cannot
-        // share it with the GTK 4 that WebKit loads. Nothing of libdecor's is
-        // needed once the chrome is drawn here.
+        // Nothing of libdecor's is needed once the chrome is drawn here.
         sdl3::video::set_hint(sdl3::video::HINT_WAYLAND_ALLOW_LIBDECOR, c"0");
         sdl3::video::set_hint(sdl3::video::HINT_WAYLAND_PREFER_LIBDECOR, c"0");
     }

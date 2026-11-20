@@ -3,7 +3,7 @@ use objc::object::Id;
 use objc::sel::Sel;
 
 use crate::engine::{self, Engine};
-use crate::gtk::{self, Ptr};
+use crate::wpe::{self, Ptr};
 use crate::send;
 use foundation::boxed;
 
@@ -32,7 +32,7 @@ pub struct Controller {
     manager: usize,
     /// Script message handlers by name, each retained, as WebKit retains them.
     handlers: Vec<(String, usize)>,
-    /// The user agent page scripts are shown, where WebKitGTK is sent a
+    /// The user agent page scripts are shown, where WPE WebKit is sent a
     /// respelling of it; see [`crate::web_view::header_user_agent`].
     page_user_agent: Option<String>,
 }
@@ -112,8 +112,8 @@ unsafe extern "C" fn script_message_received(manager: Ptr, value: Ptr, data: Ptr
 /// does on macOS.
 fn register_handler(engine: &Engine, manager: Ptr, name: &str) {
     let api = engine.api;
-    let c_name = gtk::c_string(name);
-    let signal = gtk::c_string(&format!("script-message-received::{name}"));
+    let c_name = wpe::c_string(name);
+    let signal = wpe::c_string(&format!("script-message-received::{name}"));
     // SAFETY: a live manager, strings it copies, and a handler of the signal's
     // prototype whose data is a plain integer.
     unsafe {
@@ -135,7 +135,7 @@ fn register_handler(engine: &Engine, manager: Ptr, name: &str) {
 
 fn unregister_handler(engine: &Engine, manager: Ptr, name: &str) {
     let api = engine.api;
-    let c_name = gtk::c_string(name);
+    let c_name = wpe::c_string(name);
     // SAFETY: as `register_handler`; `G_SIGNAL_MATCH_FUNC | G_SIGNAL_MATCH_DATA`.
     unsafe {
         (api.webkit_user_content_manager_unregister_script_message_handler)(
@@ -334,14 +334,14 @@ unsafe extern "C" fn init_controller(receiver: Id, _sel: Sel) -> Id {
 
 fn add_to_manager(engine: &Engine, manager: Ptr, script: &Script) {
     let api = engine.api;
-    let source = gtk::c_string(&script.source);
+    let source = wpe::c_string(&script.source);
     let frames = match script.main_frame_only {
-        true => gtk::USER_CONTENT_INJECT_TOP_FRAME,
-        false => gtk::USER_CONTENT_INJECT_ALL_FRAMES,
+        true => wpe::USER_CONTENT_INJECT_TOP_FRAME,
+        false => wpe::USER_CONTENT_INJECT_ALL_FRAMES,
     };
     let time = match script.at_document_start {
-        true => gtk::USER_SCRIPT_INJECT_AT_DOCUMENT_START,
-        false => gtk::USER_SCRIPT_INJECT_AT_DOCUMENT_END,
+        true => wpe::USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+        false => wpe::USER_SCRIPT_INJECT_AT_DOCUMENT_END,
     };
     // SAFETY: a live manager and a NUL-terminated source, which is copied.
     unsafe {
@@ -418,37 +418,6 @@ pub unsafe fn manager(object: Id, engine: &Engine) -> Ptr {
     controller.manager as Ptr
 }
 
-/// The scripts and the handler names a content controller holds, for the
-/// web view host.
-///
-/// # Safety
-///
-/// `object` must be null or an object this runtime allocated.
-pub unsafe fn content_of(object: Id) -> (Vec<Script>, Vec<String>) {
-    match unsafe { controller(object) } {
-        Some(c) => (
-            c.scripts.clone(),
-            c.handlers.iter().map(|(name, _)| name.clone()).collect(),
-        ),
-        None => (Vec::new(), Vec::new()),
-    }
-}
-
-/// The content controller of `configuration` and its handler for `name`.
-///
-/// # Safety
-///
-/// `configuration` must be a configuration.
-pub unsafe fn handler_for(configuration: Id, name: &str) -> Option<(Id, Id)> {
-    let object = unsafe { controller_of(configuration) };
-    let found = unsafe { controller(object) }?;
-    found
-        .handlers
-        .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, handler)| (object, *handler as Id))
-}
-
 /// The manager a configuration's views share, if one has been made.
 ///
 /// # Safety
@@ -459,7 +428,7 @@ pub unsafe fn existing_manager(configuration: Id) -> usize {
     unsafe { self::controller(controller as Id) }.map_or(0, |c| c.manager)
 }
 
-/// Show page scripts `agent` rather than what WebKitGTK sends.
+/// Show page scripts `agent` rather than what WPE WebKit sends.
 ///
 /// # Safety
 ///
@@ -496,7 +465,6 @@ unsafe extern "C" fn add_user_script(receiver: Id, _sel: Sel, user_script: Id) {
     {
         add_to_manager(engine, controller.manager as Ptr, user_script);
     }
-    crate::web_view::remote_content_changed(receiver);
 }
 
 unsafe extern "C" fn remove_all_user_scripts(receiver: Id, _sel: Sel) {
@@ -511,7 +479,6 @@ unsafe extern "C" fn remove_all_user_scripts(receiver: Id, _sel: Sel) {
         // The guest removed its own scripts, not the ones this port adds.
         rebuild_scripts(engine, controller);
     }
-    crate::web_view::remote_content_changed(receiver);
 }
 
 unsafe extern "C" fn user_scripts(receiver: Id, _sel: Sel) -> Id {
@@ -555,7 +522,6 @@ unsafe extern "C" fn add_script_message_handler(receiver: Id, _sel: Sel, handler
             }
         }
     }
-    crate::web_view::remote_content_changed(receiver);
 }
 
 unsafe extern "C" fn remove_script_message_handler(receiver: Id, _sel: Sel, name: Id) {
@@ -574,7 +540,6 @@ unsafe extern "C" fn remove_script_message_handler(receiver: Id, _sel: Sel, name
     {
         unregister_handler(engine, controller.manager as Ptr, &name);
     }
-    crate::web_view::remote_content_changed(receiver);
 }
 
 unsafe extern "C" fn remove_all_script_message_handlers(receiver: Id, sel: Sel) {
@@ -629,7 +594,7 @@ unsafe extern "C" fn init_preferences(receiver: Id, _sel: Sel) -> Id {
 
 /// `-setValue:forKey:`, which is how private preferences are set.
 ///
-/// The keys WebKitGTK has an equivalent for are applied; the rest - Studio's
+/// The keys WPE WebKit has an equivalent for are applied; the rest - Studio's
 /// `backspaceKeyNavigationEnabled` among them - describe behaviour this port
 /// already has or does not offer, and are accepted rather than raising the
 /// undefined-key exception KVC would.

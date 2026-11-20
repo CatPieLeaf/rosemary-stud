@@ -1,15 +1,15 @@
-//! A private Wayland compositor that WebKitGTK's windows live in.
+//! A private Wayland compositor that WPE WebKit's views live in.
 //!
-//! GTK connects to this rather than to the host's display, so each web view is
+//! WPE connects to this rather than to the host's display, so each web view is
 //! a real toplevel with a frame clock, keyboard focus and popups, and nothing
 //! about it depends on the host session. What the windows draw comes back as
 //! pixels for `appkit::backing`'s overlays; input goes in as seat events.
 //!
-//! The compositor runs on its own thread: GTK makes blocking round trips to
+//! The compositor runs on its own thread: WPE makes blocking round trips to
 //! its display, which would never return if the server were only serviced by
-//! the thread GTK itself runs on.
+//! the thread WPE itself runs on.
 
-// Only Linux has WebKitGTK, and smithay is a Linux dependency; elsewhere the
+// Only Linux has WPE WebKit, and smithay is a Linux dependency; elsewhere the
 // compositor never starts and most of this is unused.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
@@ -45,14 +45,9 @@ pub enum Composition {
     Gpu(Option<appkit::backing::Importer>),
 }
 
-/// A toplevel is named by its `wl_surface`'s protocol id, which GTK's side
+/// A toplevel is named by its `wl_surface`'s protocol id, which WPE's side
 /// reads with `wl_proxy_get_id`: there is only one client.
 pub type SurfaceId = u32;
-
-#[cfg(target_os = "linux")]
-pub(crate) use state::NAMED_PREFIX;
-#[cfg(not(target_os = "linux"))]
-pub(crate) const NAMED_PREFIX: &str = "stud-view-";
 
 /// The host display a window is on, which its output stands for.
 #[derive(Clone, Debug, PartialEq)]
@@ -98,7 +93,7 @@ pub enum Command {
     Key { key: u32, pressed: bool },
     /// Which window has the keyboard, if any.
     Focus { surface: Option<SurfaceId> },
-    /// The host's clipboard, offered to GTK as the selection: MIME type and
+    /// The host's clipboard, offered to WPE as the selection: MIME type and
     /// bytes.
     Offer { entries: Vec<(String, Vec<u8>)> },
 }
@@ -110,12 +105,8 @@ pub enum Event {
         surface: SurfaceId,
         name: Option<&'static str>,
     },
-    /// GTK set the selection; these are its contents in the types asked for.
+    /// WPE set the selection; these are its contents in the types asked for.
     Selection { entries: Vec<(String, Vec<u8>)> },
-    /// A toplevel took a title naming the view it is for: the web view host's
-    /// helper titles each of its windows `stud-view-<id>`, its only way to say
-    /// which surface is which view from another process.
-    Named { surface: SurfaceId, title: String },
 }
 
 /// What the compositor thread hands back.
@@ -130,16 +121,17 @@ pub struct Compositor {
     #[cfg(target_os = "linux")]
     commands: Sender<Command>,
     shared: Arc<Shared>,
-    /// The socket GTK connects to, which is removed once it has.
+    /// The socket WPE connects to, which is removed once it has.
     pub socket: PathBuf,
-    /// Whether windows are composed on a GPU, and GTK may render on it.
+    /// Whether windows are composed on a GPU; tests skip what needs one.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub gpu: bool,
 }
 
 impl Compositor {
     #[cfg(not(target_os = "linux"))]
     pub fn start(_wake: fn(), _composition: Composition) -> Result<Compositor, String> {
-        Err("web views need WebKitGTK, which only a Linux host has".to_string())
+        Err("web views need WPE WebKit, which only a Linux host has".to_string())
     }
 
     /// Start the compositor, listening at a fresh socket. `wake` is called

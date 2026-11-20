@@ -7,12 +7,11 @@ mod compositor;
 mod configuration;
 mod data_store;
 mod engine;
-mod gtk;
 mod js;
 mod keys;
 mod legacy;
-mod remote;
 mod web_view;
+mod wpe;
 
 /// Send a message: `send!(receiver, "selector:", argument => Type, ...; Return)`.
 ///
@@ -216,7 +215,7 @@ mod tests {
     #[test]
     fn web_view_is_a_view_that_keeps_its_configuration() {
         // SAFETY: no other test reads the environment; a unit test must not
-        // start GTK and a web process.
+        // start WPE and a web process.
         unsafe { std::env::set_var("ROSEMARY_WEBKIT", "0") };
         bootstrap();
         let class = objc::class::lookup(c"WKWebView").expect("registered");

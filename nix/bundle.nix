@@ -13,8 +13,8 @@
 , rosemary
 , fhs
 , nixpkgsInfo ? null
-  # Ship WebKitGTK, its helper processes and a TLS module for it. Without it,
-  # web views need the host's WebKitGTK 6.0.
+  # Ship WPE WebKit, its helper processes and a TLS module for it. Without it,
+  # web views need the host's WPE WebKit 2.0.
 , withWebkit ? true
   # Sonames the code builds at run time, which no scan of the binary can see.
 , extraSonames ? [ ]
@@ -30,11 +30,11 @@ let
   gccLib = stdenv.cc.cc.lib;
 
   # package.nix declares what Rosemary links and dlopens; this is that list.
-  runtimeLibs = lib.filter (p: withWebkit || (p.pname or "") != "webkitgtk") rosemary.runtimeLibs;
-  webkit = lib.findFirst (p: (p.pname or "") == "webkitgtk") null rosemary.runtimeLibs;
-  webkitHelpers = "${webkit}/libexec/webkitgtk-6.0";
+  runtimeLibs = lib.filter (p: withWebkit || (p.pname or "") != "wpewebkit") rosemary.runtimeLibs;
+  webkit = lib.findFirst (p: (p.pname or "") == "wpewebkit") null rosemary.runtimeLibs;
+  webkitHelpers = "${webkit}/libexec/wpe-webkit-2.0";
 
-  # WebKitGTK runs its helpers, bwrap and xdg-dbus-proxy from store paths fixed
+  # WPE WebKit runs its helpers, bwrap and xdg-dbus-proxy from store paths fixed
   # at build time. This library, added to WebKit's own DT_NEEDED, rewrites them
   # when they are spawned; see tools/bundle/webkit-relocate.c.
   relocate = stdenv.mkDerivation {
@@ -57,22 +57,20 @@ let
     doCheck = true;
     checkPhase = ''
       for path in ${webkitHelpers} ${bubblewrap}/bin/bwrap ${xdg-dbus-proxy}/bin/xdg-dbus-proxy; do
-        grep -qaF "$path" ${webkit}/lib/libwebkitgtk-6.0.so.4 \
-          || { echo "libwebkitgtk does not mention $path" >&2; exit 1; }
+        grep -qaF "$path" ${webkit}/lib/libWPEWebKit-2.0.so.1 \
+          || { echo "libWPEWebKit does not mention $path" >&2; exit 1; }
       done
-      grep -qaF ${bubblewrap}/bin/bwrap ${webkit}/lib/libjavascriptcoregtk-6.0.so.1 \
-        || { echo "libjavascriptcoregtk does not mention bwrap" >&2; exit 1; }
     '';
     installPhase = ''
       install -Dm755 librosemary-webkit.so $out/lib/librosemary-webkit.so
     '';
     meta = {
-      description = "Points a relocated WebKitGTK at its helper processes";
+      description = "Points a relocated WPE WebKit at its helper processes";
       license = with lib.licenses; [ mit asl20 ];
     };
   };
 
-  # WebKitGTK plays media through GStreamer and builds its pipelines from
+  # WPE WebKit plays media through GStreamer and builds its pipelines from
   # elements it finds by name; without autoaudiosink and friends the web
   # process dies on the first page. The bundled GStreamer cannot use the
   # host's plugins (other versions, maybe another glibc), so a playback set
@@ -146,29 +144,28 @@ let
       { path = "${glib-networking}/lib/gio/modules/libgiognutls.so"; dest = "lib/gio/modules"; }
       # What the web process loads to run the API's side of a page.
       {
-        path = "${webkit}/lib/webkitgtk-6.0/injected-bundle/libwebkitgtkinjectedbundle.so";
-        dest = "lib/webkitgtk-6.0/injected-bundle";
+        path = "${webkit}/lib/wpe-webkit-2.0/injected-bundle/libWPEInjectedBundle.so";
+        dest = "lib/wpe-webkit-2.0/injected-bundle";
       }
     ] ++ lib.concatMap
       ({ package, names }: map
         (name: { path = "${package}/lib/gstreamer-1.0/libgst${name}.so"; dest = "lib/gstreamer-1.0"; })
         names)
       gstPlugins;
-    executables = map (path: { inherit path; dest = "libexec/webkitgtk-6.0"; }) [
-      "${webkitHelpers}/WebKitWebProcess"
-      "${webkitHelpers}/WebKitNetworkProcess"
-      "${webkitHelpers}/WebKitGPUProcess"
+    executables = map (path: { inherit path; dest = "libexec/wpe-webkit-2.0"; }) [
+      "${webkitHelpers}/WPEWebProcess"
+      "${webkitHelpers}/WPENetworkProcess"
+      "${webkitHelpers}/WPEGPUProcess"
       # For hosts without their own; the shim prefers the host's.
       "${bubblewrap}/bin/bwrap"
       "${xdg-dbus-proxy}/bin/xdg-dbus-proxy"
     ];
     add_needed = {
-      "libwebkitgtk-6.0.so.4" = [ "librosemary-webkit.so" ];
-      "libjavascriptcoregtk-6.0.so.1" = [ "librosemary-webkit.so" ];
+      "libWPEWebKit-2.0.so.1" = [ "librosemary-webkit.so" ];
     };
     conf = [
       "default_env.GIO_EXTRA_MODULES=@ROOT@/lib/gio/modules"
-      "default_env.WEBKIT_INJECTED_BUNDLE_PATH=@ROOT@/lib/webkitgtk-6.0/injected-bundle"
+      "default_env.WEBKIT_INJECTED_BUNDLE_PATH=@ROOT@/lib/wpe-webkit-2.0/injected-bundle"
       # Only the bundle's plugins: a host plugin path would load plugins built
       # against another GStreamer. Scanned in process, as the scanner helper
       # is a store path, into a registry of its own so the host's GStreamer

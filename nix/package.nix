@@ -11,7 +11,7 @@
 , libglvnd
 , vulkan-loader
 , openal
-, webkitgtk_6_0
+, wpewebkit
 , libxkbcommon
 , ffmpeg
 , wayland
@@ -30,14 +30,14 @@ let
       libglvnd
       vulkan-loader
       openal
-      webkitgtk_6_0
+      wpewebkit
       libxkbcommon
       wayland
       # libavcodec and libavutil, opened by soname for video.
       ffmpeg
     ];
 
-  # WebKitGTK's media pipelines. GStreamer looks for plugins only in its own
+  # WPE WebKit's media pipelines. GStreamer looks for plugins only in its own
   # store path (core elements) unless told otherwise, and the web process
   # dies on a page without autoaudiosink and the rest.
   gstPlugins = with gst_all_1; [ gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav ];
@@ -121,7 +121,7 @@ craneLib.buildPackage (common // {
 
   postFixup = lib.optionalString stdenv.hostPlatform.isLinux ''
     patchelf --add-rpath ${lib.makeLibraryPath runtimeLibs} $out/bin/rosemary
-    # WebKitGTK's network stack finds TLS through a GIO module. A host
+    # WPE WebKit's network stack finds TLS through a GIO module. A host
     # GStreamer plugin path (NixOS sets one per system) would load plugins
     # built against another GStreamer, so ours replaces it.
     wrapProgram $out/bin/rosemary \

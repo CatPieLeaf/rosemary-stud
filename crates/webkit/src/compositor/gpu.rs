@@ -1,10 +1,10 @@
-//! Composition on the GPU: GTK's buffers, shared memory or dma-bufs, drawn
+//! Composition on the GPU: WPE's buffers, shared memory or dma-bufs, drawn
 //! with GLES into dma-bufs of the compositor's own, which the presenter
 //! samples without a copy, or which are read back for one that cannot.
 //!
 //! The GPU is the presenter's where it has one, since a dma-buf is only
-//! cheap to share within one device. GTK and WebKit are told about it
-//! through `linux-dmabuf`'s feedback, which makes it their device too.
+//! cheap to share within one device. WPE is told about it
+//! through `linux-dmabuf`'s feedback, which makes it its device too.
 
 use std::sync::Arc;
 
@@ -123,7 +123,7 @@ impl Gpu {
         })
     }
 
-    /// What GTK is told: this device, and the dma-bufs it imports.
+    /// What WPE is told: this device, and the dma-bufs it imports.
     pub fn feedback(&self) -> Result<DmabufFeedback, String> {
         let formats = self.renderer.dmabuf_formats();
         DmabufFeedbackBuilder::new(self.node.dev_id(), formats)

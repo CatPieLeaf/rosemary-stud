@@ -9,10 +9,10 @@ use objc::class::Class;
 use objc::object::Id;
 use objc::sel::Sel;
 
-use crate::compositor::{Command, Compositor, Event, Monitor};
+use crate::compositor::{Command, Event, Monitor};
 use crate::engine::{self, Block, Engine, HostBlock};
-use crate::gtk::{self, Ptr};
-use crate::{clipboard, configuration, keys, remote, send};
+use crate::wpe::{self, Ptr};
+use crate::{clipboard, configuration, keys, send};
 
 /// What WebKit on macOS sends; with Studio's application name appended, as
 /// `applicationNameForUserAgent` appends it. Sites choose their Mac layout, and
@@ -21,16 +21,14 @@ pub(crate) const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)";
 
 struct View {
-    /// The key GTK's callbacks carry: an address can be reused by a view made
+    /// The key WebKit's callbacks carry: an address can be reused by a view made
     /// after this one is gone, and a callback for the old one must find nothing.
     id: usize,
     object: usize,
-    /// The `WebKitWebView`, owned; zero when there is no engine.
-    gtk: usize,
-    /// The undecorated `GtkWindow` the web view is the child of, which GTK
-    /// owns until it is destroyed.
-    window: usize,
-    /// The window's `wl_surface`, by which the compositor names it.
+    /// The `WebKitWebView`, owned; zero when there is no engine. Its WPE view
+    /// and that view's toplevel go with it.
+    page: usize,
+    /// The toplevel's `wl_surface`, by which the compositor names it.
     surface: u32,
     /// Retained.
     configuration: usize,
@@ -50,26 +48,6 @@ struct View {
     cursor: Option<&'static str>,
     /// `-customUserAgent`, which replaces the configuration's agent.
     custom_user_agent: Option<String>,
-    /// Whether the page is shown by the web view host rather than WebKitGTK.
-    remote: bool,
-    /// What the host last reported of the page, which the getters answer and
-    /// key-value observers are told about.
-    page: PageState,
-    /// The size the host's window was shown at, `None` while it is hidden.
-    shown: Option<(c_int, c_int)>,
-    /// The person closed the host's window; it stays closed until the view
-    /// is hidden and shown again.
-    dismissed: bool,
-}
-
-#[derive(Clone, Default, PartialEq)]
-struct PageState {
-    url: String,
-    title: String,
-    loading: bool,
-    progress: f64,
-    back: bool,
-    forward: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -134,10 +112,10 @@ fn with_object<R>(object: Id, body: impl FnOnce(&mut View) -> R) -> Option<R> {
     })
 }
 
-/// The id GTK's callbacks for `object` carry, its `WebKitWebView`, and its
+/// The id WebKit's callbacks for `object` carry, its `WebKitWebView`, and its
 /// configuration, for the WebKit1 `WebView` built on this one.
 pub(crate) fn parts_of(object: Id) -> Option<(usize, Ptr, Id)> {
-    with_object(object, |v| (v.id, v.gtk as Ptr, v.configuration as Id)).filter(|p| !p.1.is_null())
+    with_object(object, |v| (v.id, v.page as Ptr, v.configuration as Id)).filter(|p| !p.1.is_null())
 }
 
 /// A `file:` URL with its path respelled by `respell`; anything else as is.
@@ -168,7 +146,7 @@ pub(crate) fn host_url(url: &str) -> String {
     })
 }
 
-/// A `file:` URL WebKitGTK reports, as the guest spells it.
+/// A `file:` URL WPE WebKit reports, as the guest spells it.
 pub(crate) fn guest_url(url: &str) -> String {
     respell_file_url(url, |path| {
         prefix::ns::to_guest(std::path::Path::new(path)).map(|p| p.to_string_lossy().into_owned())
@@ -181,9 +159,9 @@ pub(crate) fn object_of(id: usize) -> Option<Id> {
 }
 
 /// The `WebKitWebView` behind a `WKWebView`, with the engine to call it with.
-fn gtk_of(object: Id) -> Option<(&'static Engine, Ptr)> {
-    let gtk = with_object(object, |v| v.gtk).filter(|gtk| *gtk != 0)?;
-    Some((engine::get()?, gtk as Ptr))
+fn page_of(object: Id) -> Option<(&'static Engine, Ptr)> {
+    let page = with_object(object, |v| v.page).filter(|page| *page != 0)?;
+    Some((engine::get()?, page as Ptr))
 }
 
 /// Retained object references, released with their holder.
@@ -288,7 +266,7 @@ fn message_class() -> &'static Class {
 /// The `WKScriptMessage` for a page's message to handler `name`, from the
 /// first view showing pages through `manager`.
 ///
-/// WebKitGTK does not say which view or frame posted it; views that share a
+/// WPE WebKit does not say which view or frame posted it; views that share a
 /// manager share a content controller, and the main frame is the sender for
 /// the bridges that use this.
 pub(crate) fn script_message(manager: usize, name: &str, body: Id) -> Id {
@@ -298,13 +276,13 @@ pub(crate) fn script_message(manager: usize, name: &str, body: Id) -> Id {
             .iter()
             // SAFETY: each view's retained configuration.
             .find(|v| unsafe { configuration::existing_manager(v.configuration as Id) } == manager)
-            .map(|v| (v.object, v.gtk))
+            .map(|v| (v.object, v.page))
     });
-    let (object, gtk) = view.unwrap_or_default();
+    let (object, page) = view.unwrap_or_default();
     let url = match engine::get() {
         // SAFETY: the view's own widget; the string is the view's.
-        Some(engine) if gtk != 0 => unsafe {
-            gtk::text((engine.api.webkit_web_view_get_uri)(gtk as Ptr))
+        Some(engine) if page != 0 => unsafe {
+            wpe::text((engine.api.webkit_web_view_get_uri)(page as Ptr))
         },
         _ => String::new(),
     };
@@ -484,9 +462,9 @@ unsafe extern "C" fn zero(_receiver: Id, _sel: Sel) -> isize {
     0
 }
 
-/// The `WKNavigationAction` for a WebKitGTK navigation action.
+/// The `WKNavigationAction` for a WPE WebKit navigation action.
 ///
-/// WebKitGTK does not say which frame started a navigation or which it
+/// WPE WebKit does not say which frame started a navigation or which it
 /// targets. The source is taken to be the main frame showing the page that is
 /// loaded, which is right for the navigations a page's own script starts - the
 /// hidden-iframe messages Studio's bridge sends among them - and the target to
@@ -495,16 +473,16 @@ unsafe extern "C" fn zero(_receiver: Id, _sel: Sel) -> isize {
 /// # Safety
 ///
 /// `action` must be a live `WebKitNavigationAction`.
-unsafe fn navigation_action(engine: &Engine, gtk: Ptr, action: Ptr, new_window: bool) -> Id {
+unsafe fn navigation_action(engine: &Engine, page: Ptr, action: Ptr, new_window: bool) -> Id {
     let api = engine.api;
     // SAFETY: the caller's obligation; the strings belong to the action and
     // the view.
     let (url, kind, page) = unsafe {
         let request = (api.webkit_navigation_action_get_request)(action);
         (
-            gtk::text((api.webkit_uri_request_get_uri)(request)),
+            wpe::text((api.webkit_uri_request_get_uri)(request)),
             (api.webkit_navigation_action_get_navigation_type)(action),
-            gtk::text((api.webkit_web_view_get_uri)(gtk)),
+            wpe::text((api.webkit_web_view_get_uri)(page)),
         )
     };
     let source_url = match page.is_empty() || page == "about:blank" {
@@ -520,7 +498,7 @@ unsafe fn navigation_action(engine: &Engine, gtk: Ptr, action: Ptr, new_window: 
     autoreleased(
         action_class(),
         NavigationAction {
-            // WebKitGTK counts `OTHER` as 5; WebKit's `WKNavigationTypeOther`
+            // WPE WebKit counts `OTHER` as 5; WebKit's `WKNavigationTypeOther`
             // is -1. The rest are the same.
             navigation_type: match kind {
                 0..=4 => kind as isize,
@@ -596,20 +574,20 @@ fn delegates(id: usize) -> Option<Delegates> {
     })
 }
 
-unsafe extern "C" fn decide_policy(gtk: Ptr, decision: Ptr, kind: c_int, data: Ptr) -> c_int {
+unsafe extern "C" fn decide_policy(page: Ptr, decision: Ptr, kind: c_int, data: Ptr) -> c_int {
     let (Some(engine), Some(view)) = (engine::get(), delegates(data as usize)) else {
         return 0;
     };
     let api = engine.api;
     match kind {
-        gtk::POLICY_DECISION_NAVIGATION_ACTION | gtk::POLICY_DECISION_NEW_WINDOW_ACTION => {
+        wpe::POLICY_DECISION_NAVIGATION_ACTION | wpe::POLICY_DECISION_NEW_WINDOW_ACTION => {
             const SELECTOR: &str = "webView:decidePolicyForNavigationAction:decisionHandler:";
             // SAFETY: a navigation decision, with its action.
             let (action, url) = unsafe {
                 let action =
                     (api.webkit_navigation_policy_decision_get_navigation_action)(decision);
                 let request = (api.webkit_navigation_action_get_request)(action);
-                (action, gtk::text((api.webkit_uri_request_get_uri)(request)))
+                (action, wpe::text((api.webkit_uri_request_get_uri)(request)))
             };
             if engine::tracing() {
                 eprintln!("rosemary: webkit: navigation to {url}");
@@ -621,9 +599,9 @@ unsafe extern "C" fn decide_policy(gtk: Ptr, decision: Ptr, kind: c_int, data: P
             let object = unsafe {
                 navigation_action(
                     engine,
-                    gtk,
+                    page,
                     action,
-                    kind == gtk::POLICY_DECISION_NEW_WINDOW_ACTION,
+                    kind == wpe::POLICY_DECISION_NEW_WINDOW_ACTION,
                 )
             };
             let handler = decision_handler(engine, decision, url);
@@ -634,7 +612,7 @@ unsafe extern "C" fn decide_policy(gtk: Ptr, decision: Ptr, kind: c_int, data: P
             };
             1
         }
-        gtk::POLICY_DECISION_RESPONSE => {
+        wpe::POLICY_DECISION_RESPONSE => {
             const SELECTOR: &str = "webView:decidePolicyForNavigationResponse:decisionHandler:";
             if !engine::responds(view.navigation, SELECTOR) {
                 return 0;
@@ -643,7 +621,7 @@ unsafe extern "C" fn decide_policy(gtk: Ptr, decision: Ptr, kind: c_int, data: P
             let (url, status, main) = unsafe {
                 let response = (api.webkit_response_policy_decision_get_response)(decision);
                 (
-                    gtk::text((api.webkit_uri_response_get_uri)(response)),
+                    wpe::text((api.webkit_uri_response_get_uri)(response)),
                     (api.webkit_uri_response_get_status_code)(response),
                     (api.webkit_response_policy_decision_is_main_frame_main_resource)(decision)
                         != 0,
@@ -699,7 +677,7 @@ fn finish_navigation(id: usize) {
     }
 }
 
-unsafe extern "C" fn load_changed(gtk: Ptr, event: c_int, data: Ptr) {
+unsafe extern "C" fn load_changed(page: Ptr, event: c_int, data: Ptr) {
     let id = data as usize;
     let Some(view) = delegates(id) else {
         return;
@@ -708,13 +686,13 @@ unsafe extern "C" fn load_changed(gtk: Ptr, event: c_int, data: Ptr) {
         && let Some(engine) = engine::get()
     {
         // SAFETY: the view the signal is about.
-        let url = unsafe { gtk::text((engine.api.webkit_web_view_get_uri)(gtk)) };
+        let url = unsafe { wpe::text((engine.api.webkit_web_view_get_uri)(page)) };
         eprintln!("rosemary: webkit: load event {event} for {url}");
     }
     match event {
-        gtk::LOAD_STARTED => notify(&view, id, "webView:didStartProvisionalNavigation:"),
-        gtk::LOAD_COMMITTED => notify(&view, id, "webView:didCommitNavigation:"),
-        gtk::LOAD_FINISHED => {
+        wpe::LOAD_STARTED => notify(&view, id, "webView:didStartProvisionalNavigation:"),
+        wpe::LOAD_COMMITTED => notify(&view, id, "webView:didCommitNavigation:"),
+        wpe::LOAD_FINISHED => {
             notify(&view, id, "webView:didFinishNavigation:");
             finish_navigation(id);
         }
@@ -727,10 +705,10 @@ unsafe extern "C" fn load_changed(gtk: Ptr, event: c_int, data: Ptr) {
 }
 
 unsafe extern "C" fn load_failed(
-    _gtk: Ptr,
+    _page: Ptr,
     event: c_int,
     uri: *const c_char,
-    error: *mut gtk::GError,
+    error: *mut wpe::GError,
     data: Ptr,
 ) -> c_int {
     let id = data as usize;
@@ -740,23 +718,23 @@ unsafe extern "C" fn load_failed(
     // SAFETY: the signal's arguments, owned by WebKit for its duration.
     let (url, domain, code, message) = unsafe {
         (
-            gtk::text(uri),
-            gtk::text((engine.api.g_quark_to_string)((*error).domain)),
+            wpe::text(uri),
+            wpe::text((engine.api.g_quark_to_string)((*error).domain)),
             (*error).code,
-            gtk::text((*error).message),
+            wpe::text((*error).message),
         )
     };
     eprintln!("rosemary: webkit: loading {url} failed: {message} ({domain} {code})");
     // WebKit reports a network failure in Foundation's URL error domain, and
     // what it decided itself in its own.
     let (domain, code) = match domain.as_str() {
-        "WebKitNetworkError" if code == gtk::NETWORK_ERROR_CANCELLED => ("NSURLErrorDomain", -999),
+        "WebKitNetworkError" if code == wpe::NETWORK_ERROR_CANCELLED => ("NSURLErrorDomain", -999),
         "WebKitNetworkError" => ("NSURLErrorDomain", -1),
         "WebKitPolicyError" => ("WebKitErrorDomain", i64::from(code)),
         _ => ("NSURLErrorDomain", -1),
     };
     let error = foundation::error::make(domain, code, &message);
-    let provisional = event == gtk::LOAD_STARTED || event == 1;
+    let provisional = event == wpe::LOAD_STARTED || event == 1;
     let selector = match provisional {
         true => "webView:didFailProvisionalNavigation:withError:",
         false => "webView:didFailNavigation:withError:",
@@ -781,7 +759,7 @@ unsafe extern "C" fn load_failed(
     1
 }
 
-unsafe extern "C" fn web_process_terminated(_gtk: Ptr, reason: c_int, data: Ptr) {
+unsafe extern "C" fn web_process_terminated(_page: Ptr, reason: c_int, data: Ptr) {
     eprintln!("rosemary: webkit: the web process terminated (reason {reason})");
     let Some(view) = delegates(data as usize) else {
         return;
@@ -797,8 +775,8 @@ unsafe extern "C" fn web_process_terminated(_gtk: Ptr, reason: c_int, data: Ptr)
 
 /// A page asked for a new window. The UI delegate is asked for a view, as
 /// WebKit asks it; whatever it answers, no view is attached to the page, since
-/// a GTK view cannot be related to one the guest made.
-unsafe extern "C" fn create(gtk: Ptr, action: Ptr, data: Ptr) -> Ptr {
+/// a WPE view cannot be related to one the guest made.
+unsafe extern "C" fn create(page: Ptr, action: Ptr, data: Ptr) -> Ptr {
     let (Some(engine), Some(view)) = (engine::get(), delegates(data as usize)) else {
         return std::ptr::null_mut();
     };
@@ -806,7 +784,7 @@ unsafe extern "C" fn create(gtk: Ptr, action: Ptr, data: Ptr) -> Ptr {
         "webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:";
     if engine::responds(view.ui, SELECTOR) {
         // SAFETY: the action is live for the signal's duration.
-        let action = unsafe { navigation_action(engine, gtk, action, true) };
+        let action = unsafe { navigation_action(engine, page, action, true) };
         let features = objc::arc::autorelease(objc::object::create_instance(
             objc::class::lookup(c"WKWindowFeatures").expect("registered during bootstrap"),
             0,
@@ -825,7 +803,7 @@ unsafe extern "C" fn create(gtk: Ptr, action: Ptr, data: Ptr) -> Ptr {
 
 pub(crate) fn connect(
     engine: &Engine,
-    gtk: Ptr,
+    page: Ptr,
     signal: &std::ffi::CStr,
     handler: *const (),
     id: usize,
@@ -834,7 +812,7 @@ pub(crate) fn connect(
     // prototype; the data is a plain integer and needs no destructor.
     unsafe {
         (engine.api.g_signal_connect_data)(
-            gtk,
+            page,
             signal.as_ptr(),
             handler as Ptr,
             id as Ptr,
@@ -868,7 +846,7 @@ unsafe fn user_agent(configuration: Id) -> String {
 /// # Safety
 ///
 /// `configuration` must be the view's configuration.
-unsafe fn apply_user_agent(engine: &Engine, gtk: Ptr, configuration: Id, agent: &str) {
+unsafe fn apply_user_agent(engine: &Engine, page: Ptr, configuration: Id, agent: &str) {
     let header = header_user_agent(agent);
     let controller = unsafe { configuration::controller_of(configuration) };
     // SAFETY: the view's content controller.
@@ -879,10 +857,10 @@ unsafe fn apply_user_agent(engine: &Engine, gtk: Ptr, configuration: Id, agent: 
             (header != agent).then(|| agent.to_string()),
         )
     };
-    let header = gtk::c_string(&header);
+    let header = wpe::c_string(&header);
     // SAFETY: the view's own settings, and a string they copy.
     unsafe {
-        let settings = (engine.api.webkit_web_view_get_settings)(gtk);
+        let settings = (engine.api.webkit_web_view_get_settings)(page);
         (engine.api.webkit_settings_set_user_agent)(settings, header.as_ptr());
     }
 }
@@ -907,13 +885,7 @@ unsafe extern "C" fn set_custom_user_agent(receiver: Id, _sel: Sel, agent: Id) {
     }) else {
         return;
     };
-    if let Some((remote, id)) = remote_of(receiver) {
-        // SAFETY: the view's configuration.
-        let agent = agent.unwrap_or_else(|| unsafe { user_agent(configuration) });
-        remote.send(&["agent", &id.to_string(), &agent]);
-        return;
-    }
-    let Some((engine, gtk)) = gtk_of(receiver) else {
+    let Some((engine, page)) = page_of(receiver) else {
         return;
     };
     // SAFETY: the view's configuration.
@@ -922,12 +894,12 @@ unsafe extern "C" fn set_custom_user_agent(receiver: Id, _sel: Sel, agent: Id) {
         eprintln!("rosemary: webkit: custom user agent {agent}");
     }
     // SAFETY: as above.
-    unsafe { apply_user_agent(engine, gtk, configuration, &agent) };
+    unsafe { apply_user_agent(engine, page, configuration, &agent) };
 }
 
-/// `agent` as WebKitGTK accepts it for the `User-Agent` header.
+/// `agent` as WPE WebKit accepts it for the `User-Agent` header.
 ///
-/// WebKitGTK refuses a user agent that is not a list of `product/version`
+/// WPE WebKit refuses a user agent that is not a list of `product/version`
 /// tokens and comments, and then sends its own. A product with a second `/` -
 /// Roblox's `Roblox/DarwinRobloxApp/0.740` - is one it refuses, although
 /// macOS WebKit sends it as it is. Only the last `/` of such a product is
@@ -955,16 +927,18 @@ pub(crate) fn header_user_agent(agent: &str) -> String {
     out
 }
 
-unsafe fn make_gtk_view(engine: &Engine, configuration: Id, id: usize) -> Ptr {
+unsafe fn make_page(engine: &Engine, configuration: Id, id: usize) -> Ptr {
     let api = engine.api;
     let controller = unsafe { configuration::controller_of(configuration) };
     // SAFETY: a content controller.
     let manager = unsafe { configuration::manager(controller, engine) };
-    // SAFETY: two construct-only properties of `WebKitWebView` with objects of
-    // their types, then the terminating NULL.
-    let gtk = unsafe {
+    // SAFETY: three construct-only properties of `WebKitWebView` with objects
+    // of their types, then the terminating NULL.
+    let page = unsafe {
         (api.g_object_new)(
             (api.webkit_web_view_get_type)(),
+            c"display".as_ptr(),
+            engine.display as Ptr,
             c"network-session".as_ptr(),
             engine.session as Ptr,
             c"user-content-manager".as_ptr(),
@@ -972,11 +946,9 @@ unsafe fn make_gtk_view(engine: &Engine, configuration: Id, id: usize) -> Ptr {
             std::ptr::null::<c_char>(),
         )
     };
-    if gtk.is_null() {
-        return gtk;
+    if page.is_null() {
+        return page;
     }
-    // SAFETY: the new widget is floating until something sinks it; this owns it.
-    unsafe { (api.g_object_ref_sink)(gtk) };
     // A custom agent set before the widget existed is the one to send.
     let custom = with_view(id, |v| v.custom_user_agent.clone()).flatten();
     let agent = custom.unwrap_or_else(|| unsafe { user_agent(configuration) });
@@ -992,14 +964,14 @@ unsafe fn make_gtk_view(engine: &Engine, configuration: Id, id: usize) -> Ptr {
             (header != agent).then(|| agent.clone()),
         )
     };
-    let agent = gtk::c_string(&header);
+    let agent = wpe::c_string(&header);
     // SAFETY: a configuration's preferences.
     let developer =
         unsafe { configuration::preferences(configuration::preferences_of(configuration)) }
             .is_some_and(|p| p.developer_extras);
     // SAFETY: the view's own settings, and a string they copy.
     unsafe {
-        let settings = (api.webkit_web_view_get_settings)(gtk);
+        let settings = (api.webkit_web_view_get_settings)(page);
         (api.webkit_settings_set_user_agent)(settings, agent.as_ptr());
         (api.webkit_settings_set_enable_developer_extras)(settings, c_int::from(developer));
         (api.webkit_settings_set_enable_write_console_messages_to_stdout)(
@@ -1009,78 +981,74 @@ unsafe fn make_gtk_view(engine: &Engine, configuration: Id, id: usize) -> Ptr {
     }
     connect(
         engine,
-        gtk,
+        page,
         c"decide-policy",
         decide_policy as *const (),
         id,
     );
-    connect(engine, gtk, c"load-changed", load_changed as *const (), id);
-    connect(engine, gtk, c"load-failed", load_failed as *const (), id);
+    connect(engine, page, c"load-changed", load_changed as *const (), id);
+    connect(engine, page, c"load-failed", load_failed as *const (), id);
     connect(
         engine,
-        gtk,
+        page,
         c"web-process-terminated",
         web_process_terminated as *const (),
         id,
     );
-    connect(engine, gtk, c"create", create as *const (), id);
-    gtk
+    connect(engine, page, c"create", create as *const (), id);
+    page
 }
 
-/// Put `gtk` in a window of its own on the compositor, sized `width` by
-/// `height` until the compositor says otherwise. The window and its
-/// `wl_surface`'s id.
-fn make_window(engine: &Engine, gtk: Ptr, width: c_int, height: c_int) -> Option<(Ptr, u32)> {
+/// Map `page`'s WPE view on the compositor in a toplevel of its own, sized
+/// `width` by `height` until the compositor says otherwise. The id of the
+/// toplevel's `wl_surface`, by which the compositor knows it.
+fn map_view(engine: &Engine, page: Ptr, width: c_int, height: c_int) -> Option<u32> {
     let api = engine.api;
-    // SAFETY: a new window, which GTK owns, and the view it takes a reference
-    // to; the native and surface belong to the window and live as long.
+    // SAFETY: the page's own WPE view, a toplevel on the page's display, and
+    // a surface belonging to that toplevel, all living as long as the page.
     unsafe {
-        let window = (api.gtk_window_new)();
-        if window.is_null() {
+        let view = (api.webkit_web_view_get_wpe_view)(page);
+        if view.is_null() {
             return None;
         }
-        (api.gtk_widget_add_css_class)(window, gtk::WINDOW_CLASS.as_ptr());
-        (api.gtk_window_set_decorated)(window, 0);
-        (api.gtk_window_set_default_size)(window, width.max(1), height.max(1));
-        (api.gtk_window_set_child)(window, gtk);
-        // The web view is the window's only widget, so it is the one the
-        // keyboard goes to whenever the window has it.
-        (api.gtk_widget_grab_focus)(gtk);
-        // Realized, the window has its `wl_surface`, whose id is what the
-        // compositor knows it by; presented, it becomes a toplevel.
-        (api.gtk_widget_realize)(window);
-        let surface = (api.gtk_native_get_surface)((api.gtk_widget_get_native)(window));
-        let proxy = match surface.is_null() {
-            true => std::ptr::null_mut(),
-            false => (api.gdk_wayland_surface_get_wl_surface)(surface),
-        };
-        if proxy.is_null() {
-            (api.gtk_window_destroy)(window);
+        let mut toplevel = (api.wpe_view_get_toplevel)(view);
+        if toplevel.is_null() {
+            toplevel = (api.wpe_display_create_toplevel)(engine.display as Ptr, 1);
+            if toplevel.is_null() {
+                return None;
+            }
+            // The view keeps its own reference.
+            (api.wpe_view_set_toplevel)(view, toplevel);
+            (api.g_object_unref)(toplevel);
+        }
+        (api.wpe_toplevel_resize)(toplevel, width.max(1), height.max(1));
+        let surface = (api.wpe_view_wayland_get_wl_surface)(view);
+        if surface.is_null() {
             return None;
         }
-        let id = (api.wl_proxy_get_id)(proxy);
-        (api.gtk_window_present)(window);
-        Some((window, id))
+        let id = (api.wl_proxy_get_id)(surface);
+        (api.wpe_view_map)(view);
+        Some(id)
     }
 }
 
 /// Give the page the keyboard, or take it away, as the AppKit view becomes
 /// or stops being first responder - the same event WebKit follows on macOS.
 fn set_focused(object: Id, focused: bool) {
-    let Some(compositor) = engine::compositor() else {
+    let Some(engine) = engine::get() else {
         return;
     };
     if let Some(surface) = with_object(object, |v| v.surface).filter(|s| *s != 0) {
-        focus(compositor, surface, focused);
+        focus(engine, surface, focused);
     }
 }
 
-fn focus(compositor: &Compositor, surface: u32, focused: bool) {
+fn focus(engine: &Engine, surface: u32, focused: bool) {
     thread_local! {
         static FOCUSED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     }
     if focused {
-        clipboard::offer(compositor);
+        clipboard::offer(engine);
         FOCUSED.set(Some(surface));
     } else if FOCUSED.get() == Some(surface) {
         FOCUSED.set(None);
@@ -1097,7 +1065,7 @@ fn focus(compositor: &Compositor, surface: u32, focused: bool) {
             }
         );
     }
-    compositor.send(Command::Focus {
+    engine.compositor.send(Command::Focus {
         surface: focused.then_some(surface),
     });
 }
@@ -1142,32 +1110,29 @@ unsafe extern "C" fn init_with_frame_configuration(
         false => objc::arc::retain(configuration),
     };
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let mut gtk = std::ptr::null_mut();
-    let mut window = None;
+    let mut page = std::ptr::null_mut();
+    let mut surface = None;
     if let Some(engine) = engine::get() {
         // SAFETY: a configuration, made or retained above.
-        gtk = unsafe { make_gtk_view(engine, configuration, id) };
-        if !gtk.is_null() {
-            window = make_window(
+        page = unsafe { make_page(engine, configuration, id) };
+        if !page.is_null() {
+            surface = map_view(
                 engine,
-                gtk,
+                page,
                 frame.size.width.round() as c_int,
                 frame.size.height.round() as c_int,
             );
-            if window.is_none() {
-                engine::warn_once(
-                    "a web view's GTK window has no Wayland surface; it will not show",
-                );
+            if surface.is_none() {
+                engine::warn_once("a web view's WPE view has no Wayland surface; it will not show");
             }
         }
     }
-    let (window, surface) = window.unwrap_or((std::ptr::null_mut(), 0));
+    let surface = surface.unwrap_or(0);
     VIEWS.with(|views| {
         views.borrow_mut().push(View {
             id,
             object: receiver as usize,
-            gtk: gtk as usize,
-            window: window as usize,
+            page: page as usize,
             surface,
             configuration: configuration as usize,
             navigation_delegate: Weak::new(),
@@ -1178,27 +1143,8 @@ unsafe extern "C" fn init_with_frame_configuration(
             modifier_flags: 0,
             cursor: None,
             custom_user_agent: None,
-            remote: remote::get().is_some(),
-            page: PageState::default(),
-            shown: None,
-            dismissed: false,
         })
     });
-    if let Some(remote) = remote::get() {
-        // SAFETY: the configuration made or retained above.
-        let developer =
-            unsafe { configuration::preferences(configuration::preferences_of(configuration)) }
-                .is_some_and(|p| p.developer_extras);
-        // SAFETY: as above.
-        let agent = unsafe { user_agent(configuration) };
-        remote.send(&[
-            "create",
-            &id.to_string(),
-            &agent,
-            if developer { "1" } else { "0" },
-        ]);
-        send_content(remote, id, configuration);
-    }
     receiver
 }
 
@@ -1247,20 +1193,7 @@ fn forget(object: Id) {
         return;
     };
     appkit::backing::remove_overlay(object);
-    if view.remote
-        && let Some(remote) = remote::get()
-    {
-        remote.send(&["destroy", &view.id.to_string()]);
-        if view.surface != 0
-            && let Some(compositor) = remote::compositor()
-        {
-            focus(compositor, view.surface, false);
-            compositor.send(Command::Forget {
-                surface: view.surface,
-            });
-        }
-    }
-    if view.gtk != 0
+    if view.page != 0
         && let Some(engine) = engine::get()
     {
         let api = engine.api;
@@ -1269,7 +1202,7 @@ fn forget(object: Id) {
         unsafe {
             // `G_SIGNAL_MATCH_DATA`.
             (api.g_signal_handlers_disconnect_matched)(
-                view.gtk as Ptr,
+                view.page as Ptr,
                 16,
                 0,
                 0,
@@ -1277,14 +1210,11 @@ fn forget(object: Id) {
                 std::ptr::null_mut(),
                 view.id as Ptr,
             );
-            (api.webkit_web_view_stop_loading)(view.gtk as Ptr);
-            if view.window != 0 {
-                (api.gtk_window_destroy)(view.window as Ptr);
-            }
+            (api.webkit_web_view_stop_loading)(view.page as Ptr);
         }
-        engine::unref(api, view.gtk);
+        engine::unref(api, view.page);
         if view.surface != 0 {
-            focus(&engine.compositor, view.surface, false);
+            focus(engine, view.surface, false);
             engine.compositor.send(Command::Forget {
                 surface: view.surface,
             });
@@ -1314,120 +1244,92 @@ pub fn tick(engine: &Engine) {
         views
             .borrow()
             .iter()
-            .map(|v| (v.id, v.object, v.gtk, v.surface))
+            .map(|v| (v.id, v.object, v.page, v.surface))
             .collect()
     });
-    for (id, object, gtk, surface) in views {
-        let (object, gtk) = (object as Id, gtk as Ptr);
+    for (id, object, page, surface) in views {
+        let (object, page) = (object as Id, page as Ptr);
         let hidden = appkit::view::is_hidden_or_has_hidden_ancestor(object);
         // SAFETY: a live view, registered while it is.
         let window = unsafe { appkit::view::window_of(object) };
         let frame = unsafe { appkit::view::presentation_frame(object) };
         if engine::tracing() {
-            trace_state(id, gtk, hidden, window, frame.as_ref());
+            trace_state(id, page, hidden, window, frame.as_ref());
         }
-        if gtk.is_null() || surface == 0 {
+        if page.is_null() || surface == 0 {
             continue;
         }
-        if engine::tracing() {
-            trace_page(engine, id, gtk);
-        }
-        compose(&engine.compositor, id, object, surface, hidden, window, frame);
-    }
-    compositor_events(&engine.compositor);
-}
-
-/// Size `surface`'s window to its view, suspend it while hidden, and show
-/// the latest picture the compositor has of it.
-fn compose(
-    compositor: &Compositor,
-    id: usize,
-    object: Id,
-    surface: u32,
-    hidden: bool,
-    window: Id,
-    frame: Option<appkit::view::Frame>,
-) {
-    let shown = !hidden && appkit::window::is_shown(window);
-    let configured = match &frame {
-        Some(frame) => {
-            let density = f64::from(sdl3::video::window_pixel_density(frame.window)).max(1.0);
-            Some(Configured {
-                width: (f64::from(frame.width) / density).round().max(1.0) as c_int,
-                height: (f64::from(frame.height) / density).round().max(1.0) as c_int,
-                scale: density,
-                suspended: !shown,
-                monitor: monitor_of(frame.window),
-                dmabuf: appkit::backing::shows_dmabufs_for_view(frame.window, object as usize),
-            })
-        }
-        // Off every window: keep the size, and stop drawing.
-        None => with_view(id, |v| v.configured.clone())
-            .flatten()
-            .map(|c| Configured {
-                suspended: true,
-                ..c
-            }),
-    };
-    if let Some(configured) = configured
-        && with_view(id, |v| {
-            let changed = v.configured.as_ref() != Some(&configured);
-            if changed {
-                v.configured = Some(configured.clone());
+        let shown = !hidden && appkit::window::is_shown(window);
+        let configured = match &frame {
+            Some(frame) => {
+                let density = f64::from(sdl3::video::window_pixel_density(frame.window)).max(1.0);
+                Some(Configured {
+                    width: (f64::from(frame.width) / density).round().max(1.0) as c_int,
+                    height: (f64::from(frame.height) / density).round().max(1.0) as c_int,
+                    scale: density,
+                    suspended: !shown,
+                    monitor: monitor_of(frame.window),
+                    dmabuf: appkit::backing::shows_dmabufs_for_view(frame.window, object as usize),
+                })
             }
-            changed
-        }) == Some(true)
-    {
-        compositor.send(Command::Configure {
-            surface,
-            width: configured.width,
-            height: configured.height,
-            scale: configured.scale,
-            suspended: configured.suspended,
-            monitor: configured.monitor,
-            dmabuf: configured.dmabuf,
-        });
-    }
-    if !shown || frame.is_none() {
-        return;
-    }
-    if let Some(picture) = compositor.take_frame(surface) {
+            // Off every window: keep the size, and stop drawing.
+            None => with_view(id, |v| v.configured.clone())
+                .flatten()
+                .map(|c| Configured {
+                    suspended: true,
+                    ..c
+                }),
+        };
+        if let Some(configured) = configured
+            && with_view(id, |v| {
+                let changed = v.configured.as_ref() != Some(&configured);
+                if changed {
+                    v.configured = Some(configured.clone());
+                }
+                changed
+            }) == Some(true)
+        {
+            engine.compositor.send(Command::Configure {
+                surface,
+                width: configured.width,
+                height: configured.height,
+                scale: configured.scale,
+                suspended: configured.suspended,
+                monitor: configured.monitor,
+                dmabuf: configured.dmabuf,
+            });
+        }
         if engine::tracing() {
-            let kind = match picture.picture {
-                appkit::backing::Picture::Pixels(_) => "pixel",
-                appkit::backing::Picture::Dmabuf(_) => "dma-buf",
-            };
-            eprintln!(
-                "rosemary: webkit: view {id}: new {}x{} {kind} frame",
-                picture.width, picture.height
+            trace_page(engine, id, page);
+        }
+        if !shown || frame.is_none() {
+            continue;
+        }
+        if let Some(picture) = engine.compositor.take_frame(surface) {
+            if engine::tracing() {
+                let kind = match picture.picture {
+                    appkit::backing::Picture::Pixels(_) => "pixel",
+                    appkit::backing::Picture::Dmabuf(_) => "dma-buf",
+                };
+                eprintln!(
+                    "rosemary: webkit: view {id}: new {}x{} {kind} frame",
+                    picture.width, picture.height
+                );
+            }
+            appkit::backing::set_overlay(
+                object,
+                appkit::backing::Overlay {
+                    width: picture.width,
+                    height: picture.height,
+                    picture: picture.picture,
+                },
             );
         }
-        appkit::backing::set_overlay(
-            object,
-            appkit::backing::Overlay {
-                width: picture.width,
-                height: picture.height,
-                picture: picture.picture,
-            },
-        );
     }
-}
-
-/// What the compositor's windows asked for since the last look: a cursor, or
-/// the selection they copied.
-fn compositor_events(compositor: &Compositor) {
-    for event in compositor.take_events() {
+    for event in engine.compositor.take_events() {
         match event {
             Event::Cursor { surface, name } => set_cursor(surface, name),
             Event::Selection { entries } => clipboard::copied(entries),
-            Event::Named { surface, title } => {
-                let id = title
-                    .strip_prefix(crate::compositor::NAMED_PREFIX)
-                    .and_then(|id| id.parse::<usize>().ok());
-                if let Some(id) = id {
-                    with_view(id, |v| v.surface = surface);
-                }
-            }
         }
     }
 }
@@ -1512,7 +1414,7 @@ unsafe extern "C" fn reset_cursor_rects(receiver: Id, _sel: Sel) {
 /// `ROSEMARY_TRACE_WEBKIT`: every few seconds, where the page is, whether
 /// WebKit thinks it visible and what has focus - what separates a page that is
 /// not drawing from one that is not being given input.
-fn trace_page(engine: &Engine, id: usize, gtk: Ptr) {
+fn trace_page(engine: &Engine, id: usize, page: Ptr) {
     thread_local! {
         static LAST: RefCell<Option<Instant>> = const { RefCell::new(None) };
     }
@@ -1537,11 +1439,11 @@ fn trace_page(engine: &Engine, id: usize, gtk: Ptr) {
         let value =
             unsafe { (api.webkit_web_view_evaluate_javascript_finish)(source, result, &mut error) };
         // SAFETY: an owned error or value.
-        let text = match unsafe { gtk::take_error(api, error) } {
+        let text = match unsafe { wpe::take_error(api, error) } {
             Some((_, message)) => format!("error: {message}"),
             None => unsafe {
                 let text = (api.jsc_value_to_string)(value);
-                let owned = gtk::text(text);
+                let owned = wpe::text(text);
                 (api.g_free)(text.cast());
                 (api.g_object_unref)(value);
                 owned
@@ -1553,7 +1455,7 @@ fn trace_page(engine: &Engine, id: usize, gtk: Ptr) {
     // SAFETY: the view's widget and a script it copies.
     unsafe {
         (engine.api.webkit_web_view_evaluate_javascript)(
-            gtk,
+            page,
             script.as_ptr(),
             -1,
             std::ptr::null(),
@@ -1567,12 +1469,12 @@ fn trace_page(engine: &Engine, id: usize, gtk: Ptr) {
 
 /// `ROSEMARY_TRACE_WEBKIT`: say why a view is or is not being drawn, when
 /// that changes.
-fn trace_state(id: usize, gtk: Ptr, hidden: bool, window: Id, frame: Option<&appkit::view::Frame>) {
+fn trace_state(id: usize, page: Ptr, hidden: bool, window: Id, frame: Option<&appkit::view::Frame>) {
     thread_local! {
         static LAST: RefCell<Vec<(usize, String)>> = const { RefCell::new(Vec::new()) };
     }
     let state = format!(
-        "gtk {gtk:p}, hidden {hidden}, window {window:p} shown {}, frame {:?}",
+        "page {page:p}, hidden {hidden}, window {window:p} shown {}, frame {:?}",
         appkit::window::is_shown(window),
         frame.map(|f| (f.x, f.y, f.width, f.height, f.window_width, f.window_height)),
     );
@@ -1625,43 +1527,32 @@ unsafe extern "C" fn load_request(receiver: Id, _sel: Sel, request: Id) -> Id {
         return std::ptr::null_mut();
     };
     eprintln!("rosemary: webkit: loading {url}");
-    if let Some((remote, id)) = remote_of(receiver) {
-        let navigation = start_navigation(receiver);
-        remote.send(&[
-            "load",
-            &id.to_string(),
-            &host_url(&url),
-            &method,
-            &remote::headers_json(&headers),
-        ]);
-        return navigation;
-    }
-    let Some((engine, gtk)) = gtk_of(receiver) else {
+    let Some((engine, page)) = page_of(receiver) else {
         return std::ptr::null_mut();
     };
     if method != "GET" {
         engine::warn_once("a request's method is not sent; it is loaded as a GET");
     }
     let navigation = start_navigation(receiver);
-    let url = gtk::c_string(&host_url(&url));
+    let url = wpe::c_string(&host_url(&url));
     // SAFETY: the request copies the URI and owns its borrowed headers.
     unsafe {
         let request = (engine.api.webkit_uri_request_new)(url.as_ptr());
         let fields = (engine.api.webkit_uri_request_get_http_headers)(request);
         if !fields.is_null() {
             for (name, value) in &headers {
-                let name = gtk::c_string(name);
-                let value = gtk::c_string(value);
+                let name = wpe::c_string(name);
+                let value = wpe::c_string(value);
                 (engine.api.soup_message_headers_replace)(fields, name.as_ptr(), value.as_ptr());
             }
         }
-        (engine.api.webkit_web_view_load_request)(gtk, request);
+        (engine.api.webkit_web_view_load_request)(page, request);
         (engine.api.g_object_unref)(request);
     }
     navigation
 }
 
-/// GTK keeps its default file-origin restrictions. Per-directory grants for
+/// WebKit keeps its default file-origin restrictions. Per-directory grants for
 /// script-initiated file reads are not modeled; do not enable unrestricted
 /// file access to approximate Apple's scoped read permission.
 unsafe extern "C" fn load_file_url(receiver: Id, sel: Sel, url: Id, access: Id) -> Id {
@@ -1691,22 +1582,16 @@ fn file_within_access(file: &std::path::Path, root: &std::path::Path) -> bool {
 }
 
 unsafe extern "C" fn can_go_back(receiver: Id, _sel: Sel) -> u8 {
-    if let Some(page) = remote_page(receiver) {
-        return u8::from(page.back);
-    }
     // SAFETY: the view's widget.
-    gtk_of(receiver)
-        .is_some_and(|(engine, gtk)| unsafe { (engine.api.webkit_web_view_can_go_back)(gtk) != 0 })
+    page_of(receiver)
+        .is_some_and(|(engine, page)| unsafe { (engine.api.webkit_web_view_can_go_back)(page) != 0 })
         as u8
 }
 
 unsafe extern "C" fn can_go_forward(receiver: Id, _sel: Sel) -> u8 {
-    if let Some(page) = remote_page(receiver) {
-        return u8::from(page.forward);
-    }
     // SAFETY: the view's widget.
-    gtk_of(receiver).is_some_and(|(engine, gtk)| unsafe {
-        (engine.api.webkit_web_view_can_go_forward)(gtk) != 0
+    page_of(receiver).is_some_and(|(engine, page)| unsafe {
+        (engine.api.webkit_web_view_can_go_forward)(page) != 0
     }) as u8
 }
 
@@ -1716,14 +1601,10 @@ unsafe extern "C" fn go_back(receiver: Id, sel: Sel) -> Id {
     if unsafe { can_go_back(receiver, sel) } == 0 {
         return std::ptr::null_mut();
     }
-    if let Some((remote, id)) = remote_of(receiver) {
-        remote.send(&["back", &id.to_string()]);
-        return start_navigation(receiver);
-    }
-    let Some((engine, gtk)) = gtk_of(receiver) else {
+    let Some((engine, page)) = page_of(receiver) else {
         return std::ptr::null_mut();
     };
-    unsafe { (engine.api.webkit_web_view_go_back)(gtk) };
+    unsafe { (engine.api.webkit_web_view_go_back)(page) };
     start_navigation(receiver)
 }
 
@@ -1732,14 +1613,10 @@ unsafe extern "C" fn go_forward(receiver: Id, sel: Sel) -> Id {
     if unsafe { can_go_forward(receiver, sel) } == 0 {
         return std::ptr::null_mut();
     }
-    if let Some((remote, id)) = remote_of(receiver) {
-        remote.send(&["forward", &id.to_string()]);
-        return start_navigation(receiver);
-    }
-    let Some((engine, gtk)) = gtk_of(receiver) else {
+    let Some((engine, page)) = page_of(receiver) else {
         return std::ptr::null_mut();
     };
-    unsafe { (engine.api.webkit_web_view_go_forward)(gtk) };
+    unsafe { (engine.api.webkit_web_view_go_forward)(page) };
     start_navigation(receiver)
 }
 
@@ -1767,28 +1644,18 @@ unsafe extern "C" fn go_forward_action(receiver: Id, sel: Sel, _sender: Id) {
 }
 
 unsafe extern "C" fn stop_loading(receiver: Id, _sel: Sel) {
-    if let Some((remote, id)) = remote_of(receiver) {
-        remote.send(&["stop", &id.to_string()]);
-        return;
-    }
-    if let Some((engine, gtk)) = gtk_of(receiver) {
+    if let Some((engine, page)) = page_of(receiver) {
         // SAFETY: the view's widget.
-        unsafe { (engine.api.webkit_web_view_stop_loading)(gtk) };
+        unsafe { (engine.api.webkit_web_view_stop_loading)(page) };
     }
 }
 
 unsafe extern "C" fn url(receiver: Id, _sel: Sel) -> Id {
-    if let Some(page) = remote_page(receiver) {
-        return match page.url.is_empty() {
-            true => std::ptr::null_mut(),
-            false => objc::arc::autorelease(corefoundation::url::new(&page.url) as Id),
-        };
-    }
-    let Some((engine, gtk)) = gtk_of(receiver) else {
+    let Some((engine, page)) = page_of(receiver) else {
         return std::ptr::null_mut();
     };
     // SAFETY: the view's widget; the string is the view's.
-    let text = unsafe { gtk::text((engine.api.webkit_web_view_get_uri)(gtk)) };
+    let text = unsafe { wpe::text((engine.api.webkit_web_view_get_uri)(page)) };
     if text.is_empty() {
         return std::ptr::null_mut();
     }
@@ -1800,7 +1667,7 @@ unsafe extern "C" fn url(receiver: Id, _sel: Sel) -> Id {
 /// # Safety
 ///
 /// `value` must be a live `JSCValue`.
-pub(crate) unsafe fn bridge(api: &gtk::Api, value: Ptr) -> Id {
+pub(crate) unsafe fn bridge(api: &wpe::Api, value: Ptr) -> Id {
     unsafe {
         if (api.jsc_value_is_undefined)(value) != 0 || (api.jsc_value_is_null)(value) != 0 {
             return std::ptr::null_mut();
@@ -1820,7 +1687,7 @@ pub(crate) unsafe fn bridge(api: &gtk::Api, value: Ptr) -> Id {
             true => (api.jsc_value_to_string)(value),
             false => (api.jsc_value_to_json)(value, 0),
         };
-        let owned = gtk::text(text);
+        let owned = wpe::text(text);
         (api.g_free)(text.cast());
         if is_string {
             return engine::string(&owned);
@@ -1845,7 +1712,7 @@ unsafe extern "C" fn javascript_ready(source: Ptr, result: Ptr, data: Ptr) {
     let value =
         unsafe { (api.webkit_web_view_evaluate_javascript_finish)(source, result, &mut error) };
     // SAFETY: an error this call owns, or null.
-    match unsafe { gtk::take_error(api, error) } {
+    match unsafe { wpe::take_error(api, error) } {
         Some((_, message)) => {
             // `WKErrorJavaScriptExceptionOccurred`.
             let error = foundation::error::make("WKErrorDomain", 4, &message);
@@ -1864,20 +1731,7 @@ unsafe extern "C" fn javascript_ready(source: Ptr, result: Ptr, data: Ptr) {
 
 unsafe extern "C" fn evaluate_javascript(receiver: Id, _sel: Sel, script: Id, completion: Id) {
     let completion = Block::copy(completion);
-    if let Some((remote, id)) = remote_of(receiver) {
-        let call = remote::next_call();
-        if let Some(completion) = completion {
-            EVALUATIONS.with(|e| e.borrow_mut().push((call, completion)));
-        }
-        remote.send(&[
-            "eval",
-            &id.to_string(),
-            &call.to_string(),
-            &engine::text_of(script),
-        ]);
-        return;
-    }
-    let Some((engine, gtk)) = gtk_of(receiver) else {
+    let Some((engine, page)) = page_of(receiver) else {
         if let Some(completion) = completion {
             engine::defer(move || {
                 // `WKErrorUnknown`.
@@ -1887,8 +1741,8 @@ unsafe extern "C" fn evaluate_javascript(receiver: Id, _sel: Sel, script: Id, co
         }
         return;
     };
-    let source = gtk::c_string(&engine::text_of(script));
-    let (callback, data): (Option<gtk::AsyncReady>, Ptr) = match completion {
+    let source = wpe::c_string(&engine::text_of(script));
+    let (callback, data): (Option<wpe::AsyncReady>, Ptr) = match completion {
         Some(completion) => (
             Some(javascript_ready),
             Box::into_raw(Box::new(completion)) as Ptr,
@@ -1899,7 +1753,7 @@ unsafe extern "C" fn evaluate_javascript(receiver: Id, _sel: Sel, script: Id, co
     // box back.
     unsafe {
         (engine.api.webkit_web_view_evaluate_javascript)(
-            gtk,
+            page,
             source.as_ptr(),
             -1,
             std::ptr::null(),
@@ -1917,15 +1771,15 @@ unsafe extern "C" fn set_value_for_key(receiver: Id, sel: Sel, value: Id, key: I
     if engine::text_of(key) == "drawsBackground" {
         let draws = crate::bool_value(value);
         with_object(receiver, |v| v.draws_background = draws);
-        if let Some((engine, gtk)) = gtk_of(receiver) {
-            let color = gtk::Rgba {
+        if let Some((engine, page)) = page_of(receiver) {
+            let color = wpe::Color {
                 red: 1.0,
                 green: 1.0,
                 blue: 1.0,
                 alpha: if draws { 1.0 } else { 0.0 },
             };
             // SAFETY: the view's widget and a color it copies.
-            unsafe { (engine.api.webkit_web_view_set_background_color)(gtk, &color) };
+            unsafe { (engine.api.webkit_web_view_set_background_color)(page, &color) };
         }
         return;
     }
@@ -1952,17 +1806,17 @@ fn page_point(object: Id, event: Id) -> Option<(f64, f64)> {
 }
 
 /// The compositor, and the surface `receiver`'s page is on.
-fn surface_of(receiver: Id) -> Option<(&'static Compositor, u32)> {
+fn surface_of(receiver: Id) -> Option<(&'static Engine, u32)> {
     let surface = with_object(receiver, |v| v.surface).filter(|s| *s != 0)?;
-    Some((engine::compositor()?, surface))
+    Some((engine::get()?, surface))
 }
 
 /// Move the page's pointer to where `event` happened.
-fn pointer_to(receiver: Id, event: Id) -> Option<&'static Compositor> {
-    let (compositor, surface) = surface_of(receiver)?;
+fn pointer_to(receiver: Id, event: Id) -> Option<&'static Engine> {
+    let (engine, surface) = surface_of(receiver)?;
     let (x, y) = page_point(receiver, event)?;
-    compositor.send(Command::Pointer { surface, x, y });
-    Some(compositor)
+    engine.compositor.send(Command::Pointer { surface, x, y });
+    Some(engine)
 }
 
 /// `BTN_LEFT`, `BTN_RIGHT` and `BTN_MIDDLE`.
@@ -1987,8 +1841,8 @@ fn mouse(receiver: Id, event: Id, pressed: bool, button: usize) {
             page_point(receiver, event)
         );
     }
-    if let Some(compositor) = pointer_to(receiver, event) {
-        compositor.send(Command::Button {
+    if let Some(engine) = pointer_to(receiver, event) {
+        engine.compositor.send(Command::Button {
             button: BUTTONS[button],
             pressed,
         });
@@ -2024,7 +1878,7 @@ unsafe extern "C" fn mouse_moved(receiver: Id, _sel: Sel, event: Id) {
 }
 
 unsafe extern "C" fn scroll_wheel(receiver: Id, _sel: Sel, event: Id) {
-    let Some(compositor) = pointer_to(receiver, event) else {
+    let Some(engine) = pointer_to(receiver, event) else {
         return;
     };
     // SAFETY: an event; the deltas are `CGFloat (id, SEL)` and the precision
@@ -2038,8 +1892,8 @@ unsafe extern "C" fn scroll_wheel(receiver: Id, _sel: Sel, event: Id) {
     };
     // AppKit's deltas are positive toward the top and left of the content,
     // Wayland's toward the bottom and right. A wheel's are in lines, which
-    // become notches for GTK; a touchpad's are already pixels.
-    // libinput reports a notch as 15 pixels, which is what GTK expects.
+    // become notches; a touchpad's are already pixels.
+    // libinput reports a notch as 15 pixels, which is what Wayland clients expect.
     const LINE: f64 = 15.0;
     let command = match precise {
         true => Command::Axis {
@@ -2053,38 +1907,38 @@ unsafe extern "C" fn scroll_wheel(receiver: Id, _sel: Sel, event: Id) {
             steps: Some(((-dx * 120.0).round() as i32, (-dy * 120.0).round() as i32)),
         },
     };
-    compositor.send(command);
+    engine.compositor.send(command);
 }
 
 /// Bring the keyboard's modifiers into line with the event's, so a key is
 /// read with what is held when it is pressed even if a `-flagsChanged:` went
 /// elsewhere.
-fn sync_modifiers(compositor: &Compositor, receiver: Id, event: Id) {
+fn sync_modifiers(engine: &Engine, receiver: Id, event: Id) {
     // SAFETY: an event; `-modifierFlags` is `NSUInteger (id, SEL)`.
     let flags = unsafe { send!(event, "modifierFlags"; u64) };
     let before = with_object(receiver, |v| {
         std::mem::replace(&mut v.modifier_flags, flags)
     });
     for (key, pressed) in keys::modifier_changes(before.unwrap_or_default(), flags) {
-        compositor.send(Command::Key { key, pressed });
+        engine.compositor.send(Command::Key { key, pressed });
     }
 }
 
 fn key(receiver: Id, event: Id, pressed: bool) {
-    let Some((compositor, _)) = surface_of(receiver) else {
+    let Some((engine, _)) = surface_of(receiver) else {
         return;
     };
-    sync_modifiers(compositor, receiver, event);
+    sync_modifiers(engine, receiver, event);
     // SAFETY: an event; both accessors are AppKit's own prototypes.
     let (code, repeat) = unsafe { (send!(event, "keyCode"; u16), send!(event, "isARepeat"; u8)) };
-    // GTK repeats a held key itself, at the rate the compositor gives it.
+    // WPE repeats a held key itself, at the rate the compositor gives it.
     if repeat != 0 {
         return;
     }
     let Some(key) = keys::evdev(code) else {
         return;
     };
-    // Command-V: GTK is about to read the clipboard, which has to be the
+    // Command-V: WPE is about to read the clipboard, which has to be the
     // host's by then.
     if pressed
         && key == 47
@@ -2092,7 +1946,7 @@ fn key(receiver: Id, event: Id, pressed: bool) {
             & appkit::keymap::flags::COMMAND
             != 0
     {
-        clipboard::offer(compositor);
+        clipboard::offer(engine);
     }
     if engine::tracing() {
         eprintln!(
@@ -2100,7 +1954,7 @@ fn key(receiver: Id, event: Id, pressed: bool) {
             if pressed { "down" } else { "up" }
         );
     }
-    compositor.send(Command::Key { key, pressed });
+    engine.compositor.send(Command::Key { key, pressed });
 }
 
 unsafe extern "C" fn key_down(receiver: Id, _sel: Sel, event: Id) {
@@ -2113,7 +1967,7 @@ unsafe extern "C" fn key_up(receiver: Id, _sel: Sel, event: Id) {
 
 /// `-performKeyEquivalent:`: the editing shortcuts are the page's while it
 /// has the keyboard, as they are WebKit's on a Mac, and reach it as the keys
-/// they are, so the page sees them and GTK performs them. Every other
+/// they are, so the page sees them and WebKit performs them. Every other
 /// shortcut is left to the menus.
 unsafe extern "C" fn perform_key_equivalent(receiver: Id, _sel: Sel, event: Id) -> u8 {
     // SAFETY: a live view and an event; each accessor is AppKit's prototype.
@@ -2139,22 +1993,18 @@ unsafe extern "C" fn perform_key_equivalent(receiver: Id, _sel: Sel, event: Id) 
 }
 
 unsafe extern "C" fn flags_changed(receiver: Id, _sel: Sel, event: Id) {
-    if let Some((compositor, _)) = surface_of(receiver) {
-        sync_modifiers(compositor, receiver, event);
+    if let Some((engine, _)) = surface_of(receiver) {
+        sync_modifiers(engine, receiver, event);
     }
 }
 
 fn editing(receiver: Id, command: &std::ffi::CStr) {
-    if let Some((remote, id)) = remote_of(receiver) {
-        remote.send(&["edit", &id.to_string(), &command.to_string_lossy()]);
-        return;
-    }
-    if let Some((engine, gtk)) = gtk_of(receiver) {
+    if let Some((engine, page)) = page_of(receiver) {
         if engine::tracing() {
             eprintln!("rosemary: webkit: editing command {command:?}");
         }
         // SAFETY: the view's widget and a command name.
-        unsafe { (engine.api.webkit_web_view_execute_editing_command)(gtk, command.as_ptr()) };
+        unsafe { (engine.api.webkit_web_view_execute_editing_command)(page, command.as_ptr()) };
     }
 }
 
@@ -2167,8 +2017,8 @@ unsafe extern "C" fn cut(receiver: Id, _sel: Sel, _sender: Id) {
 }
 
 unsafe extern "C" fn paste(receiver: Id, _sel: Sel, _sender: Id) {
-    if let Some(compositor) = engine::compositor() {
-        clipboard::offer(compositor);
+    if let Some(engine) = engine::get() {
+        clipboard::offer(engine);
     }
     editing(receiver, c"Paste");
 }
@@ -2183,659 +2033,6 @@ unsafe extern "C" fn undo(receiver: Id, _sel: Sel, _sender: Id) {
 
 unsafe extern "C" fn redo(receiver: Id, _sel: Sel, _sender: Id) {
     editing(receiver, c"Redo");
-}
-
-// ---------------------------------------------------------------------------
-// Pages shown by the web view host; see `crate::remote`.
-
-thread_local! {
-    /// `-evaluateJavaScript:completionHandler:` calls the host has yet to answer.
-    static EVALUATIONS: RefCell<Vec<(usize, Block)>> = const { RefCell::new(Vec::new()) };
-}
-
-/// The host and the view's id, for a view the host shows.
-fn remote_of(object: Id) -> Option<(&'static remote::Remote, usize)> {
-    let id = with_object(object, |v| v.remote.then_some(v.id)).flatten()?;
-    Some((remote::get()?, id))
-}
-
-/// What the host last said of a view's page, for a view the host shows.
-fn remote_page(object: Id) -> Option<PageState> {
-    with_object(object, |v| v.remote.then(|| v.page.clone())).flatten()
-}
-
-/// Send the host a view's scripts and message handler names.
-fn send_content(remote: &remote::Remote, id: usize, configuration: Id) {
-    // SAFETY: a view's configuration.
-    let controller = unsafe { configuration::controller_of(configuration) };
-    // SAFETY: its content controller.
-    let (scripts, handlers) = unsafe { configuration::content_of(controller) };
-    let flag = |on: bool| if on { "1" } else { "0" }.to_string();
-    let mut fields = vec!["scripts".to_string(), id.to_string(), scripts.len().to_string()];
-    for script in scripts {
-        fields.push(script.source);
-        fields.push(flag(script.at_document_start));
-        fields.push(flag(script.main_frame_only));
-    }
-    remote.send(&fields.iter().map(String::as_str).collect::<Vec<_>>());
-    let mut fields = vec!["handlers".to_string(), id.to_string()];
-    fields.extend(handlers);
-    remote.send(&fields.iter().map(String::as_str).collect::<Vec<_>>());
-}
-
-/// A content controller's scripts or handlers changed: every view the host
-/// shows with it gets them again.
-pub(crate) fn remote_content_changed(controller: Id) {
-    let Some(remote) = remote::get() else {
-        return;
-    };
-    let views: Vec<(usize, usize)> = VIEWS.with(|views| {
-        views
-            .borrow()
-            .iter()
-            .filter(|v| v.remote)
-            .map(|v| (v.id, v.configuration))
-            .collect()
-    });
-    for (id, configuration) in views {
-        // SAFETY: each view's retained configuration.
-        if unsafe { configuration::controller_of(configuration as Id) } == controller {
-            send_content(remote, id, configuration as Id);
-        }
-    }
-}
-
-/// Show each view's window while the view is shown, at the view's size, and
-/// hide it otherwise.
-pub(crate) fn remote_tick() {
-    let Some(remote) = remote::get() else {
-        return;
-    };
-    // With the helper, pages are windows of a compositor of this process's own
-    // and drawn into the view, as WebKitGTK's are.
-    let compositor = remote::compositor();
-    let views: Vec<(usize, usize)> = VIEWS.with(|views| {
-        views
-            .borrow()
-            .iter()
-            .filter(|v| v.remote)
-            .map(|v| (v.id, v.object))
-            .collect()
-    });
-    for (id, object) in views {
-        let object = object as Id;
-        let hidden = appkit::view::is_hidden_or_has_hidden_ancestor(object);
-        // SAFETY: a live view, registered while it is.
-        let window = unsafe { appkit::view::window_of(object) };
-        let shown = !hidden && !window.is_null() && appkit::window::is_shown(window);
-        // A view put in a window is sized by the layout after it, and the
-        // window is shown at the view's size: until the view has one, it
-        // waits.
-        let bounds = appkit::view::bounds_of(object);
-        let (width, height) = (
-            bounds.size.width.round() as c_int,
-            bounds.size.height.round() as c_int,
-        );
-        let size = (shown && width > 0 && height > 0).then_some((width, height));
-        let change = with_view(id, |v| {
-            if !shown {
-                v.dismissed = false;
-            }
-            let wanted = if v.dismissed { None } else { size };
-            // Shown at the view's size once: after that the window is the
-            // person's to size.
-            let changed = wanted.is_some() != v.shown.is_some();
-            if changed {
-                v.shown = wanted;
-            }
-            changed.then_some(wanted)
-        })
-        .flatten();
-        match change {
-            Some(Some((width, height))) => remote.send(&[
-                "show",
-                &id.to_string(),
-                &width.to_string(),
-                &height.to_string(),
-            ]),
-            Some(None) => remote.send(&["hide", &id.to_string()]),
-            None => {}
-        }
-        if let Some(compositor) = compositor
-            && let Some(surface) = with_view(id, |v| v.surface).filter(|s| *s != 0)
-        {
-            // SAFETY: a live view, registered while it is.
-            let frame = unsafe { appkit::view::presentation_frame(object) };
-            compose(compositor, id, object, surface, hidden, window, frame);
-        }
-    }
-    if let Some(compositor) = compositor {
-        compositor_events(compositor);
-    }
-}
-
-
-/// A navigation action for a page at `page` going to `url`.
-fn remote_action(url: &str, page: &str, kind: isize, main: bool, new_window: bool) -> Id {
-    let source_url = match page.is_empty() || page == "about:blank" {
-        true => url,
-        false => page,
-    };
-    let request = foundation::urlsession::request_for(url);
-    let mut objects = vec![request, frame_info(source_url, true)];
-    if !new_window {
-        objects.push(frame_info(url, main));
-    }
-    autoreleased(
-        action_class(),
-        NavigationAction {
-            navigation_type: kind,
-            objects: Owned::new(&objects),
-        },
-    )
-}
-
-struct RemoteDecision {
-    view: usize,
-    /// The host's number for a navigation it holds; `None` for a response,
-    /// which it does not hold, and which a cancel stops.
-    decision: Option<String>,
-    done: std::sync::atomic::AtomicBool,
-}
-
-/// `void (^)(WKNavigationActionPolicy)` and the response form: cancel is 0,
-/// allow is 1, and a download is not offered, so it cancels.
-unsafe extern "C" fn remote_decide(block: *mut HostBlock<RemoteDecision>, policy: isize) {
-    // SAFETY: the block `remote_policy` or `remote_response` made.
-    let context = unsafe { &(*block).context };
-    if context.done.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let Some(remote) = remote::get() else {
-        return;
-    };
-    match &context.decision {
-        Some(decision) => remote.send(&["decide", decision, if policy == 1 { "1" } else { "0" }]),
-        None if policy != 1 => remote.send(&["stop", &context.view.to_string()]),
-        None => {}
-    }
-}
-
-fn remote_policy(remote: &remote::Remote, view: &Delegates, id: usize, message: &[String]) {
-    const SELECTOR: &str = "webView:decidePolicyForNavigationAction:decisionHandler:";
-    let decision = remote::field(message, 2).to_string();
-    let url = guest_url(remote::field(message, 3));
-    if engine::tracing() {
-        eprintln!("rosemary: webkit: navigation to {url}");
-    }
-    if !engine::responds(view.navigation, SELECTOR) {
-        remote.send(&["decide", &decision, "1"]);
-        return;
-    }
-    let page = with_view(id, |v| v.page.url.clone()).unwrap_or_default();
-    let action = remote_action(
-        &url,
-        &page,
-        remote::number(message, 4) as isize,
-        remote::number(message, 5) != 0,
-        remote::number(message, 6) != 0,
-    );
-    let handler = engine::host_block(
-        remote_decide as *const std::ffi::c_void,
-        RemoteDecision {
-            view: id,
-            decision: Some(decision),
-            done: std::sync::atomic::AtomicBool::new(false),
-        },
-    );
-    // SAFETY: the delegate answers the selector, whose prototype this is.
-    unsafe {
-        send!(view.navigation, "webView:decidePolicyForNavigationAction:decisionHandler:",
-            view.object => Id, action => Id, handler => Id; ())
-    };
-}
-
-fn remote_response(view: &Delegates, id: usize, message: &[String]) {
-    const SELECTOR: &str = "webView:decidePolicyForNavigationResponse:decisionHandler:";
-    if !engine::responds(view.navigation, SELECTOR) {
-        return;
-    }
-    let url = guest_url(remote::field(message, 2));
-    let status = remote::number(message, 3) as u16;
-    let response = foundation::urlsession::http_response(&url, status, Vec::new());
-    let object = autoreleased(
-        response_class(),
-        NavigationResponse {
-            main: remote::number(message, 4) != 0,
-            objects: Owned::new(&[response]),
-        },
-    );
-    let handler = engine::host_block(
-        remote_decide as *const std::ffi::c_void,
-        RemoteDecision {
-            view: id,
-            decision: None,
-            done: std::sync::atomic::AtomicBool::new(false),
-        },
-    );
-    // SAFETY: the delegate answers the selector.
-    unsafe {
-        send!(view.navigation, "webView:decidePolicyForNavigationResponse:decisionHandler:",
-            view.object => Id, object => Id, handler => Id; ())
-    };
-}
-
-fn remote_failed(view: &Delegates, id: usize, message: &[String]) {
-    let provisional = remote::number(message, 2) != 0;
-    let url = remote::field(message, 3);
-    let (domain, code, text) = (
-        remote::field(message, 4),
-        remote::number(message, 5),
-        remote::field(message, 6),
-    );
-    eprintln!("rosemary: webkit: loading {url} failed: {text} ({domain} {code})");
-    let error = foundation::error::make(domain, code, text);
-    let selector = match provisional {
-        true => "webView:didFailProvisionalNavigation:withError:",
-        false => "webView:didFailNavigation:withError:",
-    };
-    if engine::responds(view.navigation, selector) {
-        let navigation = with_view(id, |v| v.navigation).unwrap_or_default() as Id;
-        // SAFETY: the delegate answers the selector, `void (id, SEL, id, id, id)`.
-        unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id) =
-                std::mem::transmute(objc::msg::entry());
-            f(
-                view.navigation,
-                objc::sel::get(selector),
-                view.object,
-                navigation,
-                error,
-            );
-        }
-    }
-    finish_navigation(id);
-}
-
-/// The page's state moved: observers of each key that changed hear of it, as
-/// WebKit's key-value observing tells them.
-fn remote_state(view: &Delegates, id: usize, message: &[String]) {
-    let state = PageState {
-        url: guest_url(remote::field(message, 2)),
-        title: remote::field(message, 3).to_string(),
-        loading: remote::number(message, 4) != 0,
-        progress: remote::field(message, 5).parse().unwrap_or(0.0),
-        back: remote::number(message, 6) != 0,
-        forward: remote::number(message, 7) != 0,
-    };
-    let Some(old) = with_view(id, |v| v.page.clone()) else {
-        return;
-    };
-    let mut keys = Vec::new();
-    if old.title != state.title {
-        keys.push("title");
-    }
-    if old.url != state.url {
-        keys.push("URL");
-    }
-    if old.loading != state.loading {
-        keys.push("loading");
-    }
-    if old.progress != state.progress {
-        keys.push("estimatedProgress");
-    }
-    if old.back != state.back {
-        keys.push("canGoBack");
-    }
-    if old.forward != state.forward {
-        keys.push("canGoForward");
-    }
-    for key in &keys {
-        // SAFETY: a live view; `-willChangeValueForKey:` is `void (id, SEL, id)`.
-        unsafe { send!(view.object, "willChangeValueForKey:", engine::string(key) => Id; ()) };
-    }
-    with_view(id, |v| v.page = state);
-    for key in keys.iter().rev() {
-        // SAFETY: as above.
-        unsafe { send!(view.object, "didChangeValueForKey:", engine::string(key) => Id; ()) };
-    }
-}
-
-fn ns_null() -> Id {
-    let class = objc::class::lookup(c"NSNull").expect("registered by Foundation");
-    // SAFETY: `+null` is `id (Class, SEL)`.
-    unsafe { send!(objc::class::ptr(class) as Id, "null"; Id) }
-}
-
-/// A page called `window.webkit.messageHandlers.NAME.postMessage(body)`.
-fn remote_message(view: &Delegates, message: &[String]) {
-    let name = remote::field(message, 2);
-    // SAFETY: the view's configuration.
-    let Some((controller, handler)) =
-        (unsafe { configuration::handler_for(view.configuration, name) })
-    else {
-        return;
-    };
-    // The host sends `{"v": body}`; a page that posts `null` or `undefined`
-    // gets `NSNull`, as WebKit gives.
-    let body = remote::value_for(remote::json_object(remote::field(message, 3)), "v");
-    let body = if body.is_null() { ns_null() } else { body };
-    let url = guest_url(remote::field(message, 4));
-    if engine::tracing() {
-        eprintln!("rosemary: webkit: script message to '{name}'");
-    }
-    let object = autoreleased(
-        message_class(),
-        ScriptMessage {
-            name: name.to_string(),
-            objects: Owned::new(&[body, view.object, frame_info(&url, true)]),
-        },
-    );
-    // SAFETY: a handler answers the `WKScriptMessageHandler` method.
-    unsafe {
-        send!(handler, "userContentController:didReceiveScriptMessage:",
-            controller => Id, object => Id; ())
-    };
-}
-
-/// The answer to `-evaluateJavaScript:completionHandler:`: the host sends
-/// `{"v": value}`, `{"u": true}` for undefined, `{"t": true}` for a value of a
-/// type WebKit does not bridge, or `{"e": message}` for an exception.
-pub(crate) fn remote_eval_result(message: &[String]) {
-    let call = remote::number(message, 1) as usize;
-    let completion = EVALUATIONS.with(|e| {
-        let mut e = e.borrow_mut();
-        let at = e.iter().position(|(c, _)| *c == call)?;
-        Some(e.remove(at).1)
-    });
-    let Some(completion) = completion else {
-        return;
-    };
-    let answer = remote::json_object(remote::field(message, 2));
-    let exception = remote::value_for(answer, "e");
-    if answer.is_null() {
-        // `WKErrorUnknown`.
-        let error = foundation::error::make("WKErrorDomain", 1, "no web content");
-        completion.call2(std::ptr::null_mut(), error);
-    } else if !exception.is_null() {
-        // `WKErrorJavaScriptExceptionOccurred`.
-        let error =
-            foundation::error::make("WKErrorDomain", 4, &engine::text_of(exception));
-        completion.call2(std::ptr::null_mut(), error);
-    } else if !remote::value_for(answer, "t").is_null() {
-        // `WKErrorJavaScriptResultTypeIsUnsupported`.
-        let error = foundation::error::make(
-            "WKErrorDomain",
-            5,
-            "JavaScript execution returned a result of an unsupported type",
-        );
-        completion.call2(std::ptr::null_mut(), error);
-    } else if !remote::value_for(answer, "u").is_null() {
-        completion.call2(std::ptr::null_mut(), std::ptr::null_mut());
-    } else {
-        completion.call2(remote::value_for(answer, "v"), std::ptr::null_mut());
-    }
-}
-
-struct DialogReply {
-    call: String,
-    done: std::sync::atomic::AtomicBool,
-}
-
-fn reply_dialog(context: &DialogReply, ok: bool, text: &str) {
-    if context.done.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    if let Some(remote) = remote::get() {
-        remote.send(&["dialog_reply", &context.call, if ok { "1" } else { "0" }, text]);
-    }
-}
-
-/// `void (^)(void)`, for an alert.
-unsafe extern "C" fn dialog_done(block: *mut HostBlock<DialogReply>) {
-    // SAFETY: the block `remote_dialog` made.
-    reply_dialog(unsafe { &(*block).context }, true, "");
-}
-
-/// `void (^)(BOOL)`, for a confirmation.
-unsafe extern "C" fn dialog_confirmed(block: *mut HostBlock<DialogReply>, confirmed: u8) {
-    // SAFETY: as above.
-    reply_dialog(unsafe { &(*block).context }, confirmed != 0, "");
-}
-
-/// `void (^)(NSString *)`, for a prompt: nil is a cancel.
-unsafe extern "C" fn dialog_answered(block: *mut HostBlock<DialogReply>, text: Id) {
-    // SAFETY: as above.
-    let context = unsafe { &(*block).context };
-    reply_dialog(context, !text.is_null(), &engine::text_of(text));
-}
-
-/// A page's `alert`, `confirm` or `prompt`, which the UI delegate answers;
-/// without one, an alert is dismissed, a confirmation declined and a prompt
-/// cancelled, as WebKit does.
-fn remote_dialog(remote: &remote::Remote, view: &Delegates, message: &[String]) {
-    let call = remote::field(message, 2).to_string();
-    let kind = remote::field(message, 3);
-    let text = engine::string(remote::field(message, 4));
-    let default = engine::string(remote::field(message, 5));
-    let frame = frame_info(&guest_url(remote::field(message, 6)), true);
-    let context = || DialogReply {
-        call: call.clone(),
-        done: std::sync::atomic::AtomicBool::new(false),
-    };
-    const ALERT: &str = "webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:";
-    const CONFIRM: &str =
-        "webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:";
-    const PROMPT: &str = "webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:";
-    // SAFETY: each delegate method is sent only when the delegate answers it,
-    // with its own prototype.
-    unsafe {
-        match kind {
-            "alert" if engine::responds(view.ui, ALERT) => {
-                let handler = engine::host_block(dialog_done as *const std::ffi::c_void, context());
-                send!(view.ui, "webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:",
-                    view.object => Id, text => Id, frame => Id, handler => Id; ());
-            }
-            "confirm" if engine::responds(view.ui, CONFIRM) => {
-                let handler =
-                    engine::host_block(dialog_confirmed as *const std::ffi::c_void, context());
-                send!(view.ui, "webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:",
-                    view.object => Id, text => Id, frame => Id, handler => Id; ());
-            }
-            "prompt" if engine::responds(view.ui, PROMPT) => {
-                let handler =
-                    engine::host_block(dialog_answered as *const std::ffi::c_void, context());
-                send!(view.ui, "webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:",
-                    view.object => Id, text => Id, default => Id, frame => Id, handler => Id; ());
-            }
-            "alert" => remote.send(&["dialog_reply", &call, "1", ""]),
-            _ => remote.send(&["dialog_reply", &call, "0", ""]),
-        }
-    }
-}
-
-/// A page opened a window: the UI delegate is asked for a view, as WebKit asks
-/// it, and the view it answers loads what the page opened.
-fn remote_new_window(view: &Delegates, id: usize, message: &[String]) {
-    const SELECTOR: &str =
-        "webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:";
-    if !engine::responds(view.ui, SELECTOR) {
-        return;
-    }
-    let url = guest_url(remote::field(message, 2));
-    let page = with_view(id, |v| v.page.url.clone()).unwrap_or_default();
-    // `WKNavigationTypeOther`.
-    let action = remote_action(&url, &page, -1, true, true);
-    let features = objc::arc::autorelease(objc::object::create_instance(
-        objc::class::lookup(c"WKWindowFeatures").expect("registered during bootstrap"),
-        0,
-    ));
-    // SAFETY: the delegate answers the selector.
-    let created = unsafe {
-        send!(view.ui, "webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:",
-            view.object => Id, view.configuration => Id, action => Id, features => Id; Id)
-    };
-    if !created.is_null() && with_object(created, |_| ()).is_some() {
-        let request = foundation::urlsession::request_for(&url);
-        // SAFETY: a web view; `-loadRequest:` is `id (id, SEL, id)`.
-        unsafe { send!(created, "loadRequest:", request => Id; Id) };
-    }
-}
-
-/// Whether `object` is all its window holds: its content view, or the content
-/// view's one subview.
-fn fills_window(object: Id) -> bool {
-    // SAFETY: a live view; each accessor is AppKit's own prototype.
-    unsafe {
-        let window = send!(object, "window"; Id);
-        if window.is_null() {
-            return false;
-        }
-        let content = send!(window, "contentView"; Id);
-        if content == object {
-            return true;
-        }
-        let subviews = send!(content, "subviews"; Id);
-        send!(object, "superview"; Id) == content
-            && !subviews.is_null()
-            && send!(subviews, "count"; usize) == 1
-    }
-}
-
-/// The page's window closed: the person closed the host's window, or the page
-/// called `window.close()`. The UI delegate hears it as `webViewDidClose:`,
-/// as WebKit tells it when a page closes. Without one, a window that holds
-/// nothing but the page closes with it, and a page that is part of a larger
-/// window only goes away until it is shown again.
-fn remote_closed(view: &Delegates, id: usize) {
-    with_view(id, |v| {
-        v.dismissed = true;
-        v.shown = None;
-    });
-    if engine::responds(view.ui, "webViewDidClose:") {
-        // SAFETY: the delegate answers the selector, `void (id, SEL, id)`.
-        unsafe { send!(view.ui, "webViewDidClose:", view.object => Id; ()) };
-        return;
-    }
-    if fills_window(view.object) {
-        // SAFETY: a live view in a window; `-performClose:` is `void (id, SEL, id)`.
-        unsafe {
-            let window = send!(view.object, "window"; Id);
-            send!(window, "performClose:", std::ptr::null_mut::<std::ffi::c_void>() as Id => Id; ());
-        }
-    }
-}
-
-/// A message from the host about one of its views.
-pub(crate) fn remote_event(message: &[String]) {
-    let Some(remote) = remote::get() else {
-        return;
-    };
-    let id = remote::number(message, 1) as usize;
-    let Some(view) = delegates(id) else {
-        // The view is gone, but a page waiting on an answer still needs one.
-        match message[0].as_str() {
-            "policy" => remote.send(&["decide", remote::field(message, 2), "0"]),
-            "dialog" => remote.send(&["dialog_reply", remote::field(message, 2), "0", ""]),
-            _ => {}
-        }
-        return;
-    };
-    if engine::tracing() {
-        eprintln!("rosemary: webkit: host: {:?}", &message[..message.len().min(4)]);
-    }
-    match message[0].as_str() {
-        "policy" => remote_policy(remote, &view, id, message),
-        "response" => remote_response(&view, id, message),
-        "started" => notify(&view, id, "webView:didStartProvisionalNavigation:"),
-        "redirect" => notify(
-            &view,
-            id,
-            "webView:didReceiveServerRedirectForProvisionalNavigation:",
-        ),
-        "committed" => notify(&view, id, "webView:didCommitNavigation:"),
-        "finished" => {
-            notify(&view, id, "webView:didFinishNavigation:");
-            finish_navigation(id);
-        }
-        "failed" => remote_failed(&view, id, message),
-        "state" => remote_state(&view, id, message),
-        "message" => remote_message(&view, message),
-        "dialog" => remote_dialog(remote, &view, message),
-        "new_window" => remote_new_window(&view, id, message),
-        "closed" => remote_closed(&view, id),
-        "terminated" => {
-            eprintln!("rosemary: webkit: the web process terminated");
-            const SELECTOR: &str = "webViewWebContentProcessDidTerminate:";
-            if engine::responds(view.navigation, SELECTOR) {
-                // SAFETY: the delegate answers the selector.
-                unsafe {
-                    send!(view.navigation, "webViewWebContentProcessDidTerminate:", view.object => Id; ())
-                };
-            }
-        }
-        other => engine::warn_once(&format!("the web view host sent '{other}', which is unknown")),
-    }
-}
-
-/// `-title`.
-unsafe extern "C" fn title(receiver: Id, _sel: Sel) -> Id {
-    if let Some(page) = remote_page(receiver) {
-        return engine::string(&page.title);
-    }
-    let Some((engine, gtk)) = gtk_of(receiver) else {
-        return std::ptr::null_mut();
-    };
-    // SAFETY: the view's widget; the string is the view's.
-    engine::string(&unsafe { gtk::text((engine.api.webkit_web_view_get_title)(gtk)) })
-}
-
-/// `-isLoading`.
-unsafe extern "C" fn is_loading(receiver: Id, _sel: Sel) -> u8 {
-    remote_page(receiver).is_some_and(|page| page.loading) as u8
-}
-
-/// `-estimatedProgress`.
-unsafe extern "C" fn estimated_progress(receiver: Id, _sel: Sel) -> f64 {
-    remote_page(receiver).map_or(0.0, |page| page.progress)
-}
-
-/// `-reload`, answering the navigation it starts.
-unsafe extern "C" fn reload(receiver: Id, _sel: Sel) -> Id {
-    if let Some((remote, id)) = remote_of(receiver) {
-        remote.send(&["reload", &id.to_string()]);
-        return start_navigation(receiver);
-    }
-    let Some((engine, gtk)) = gtk_of(receiver) else {
-        return std::ptr::null_mut();
-    };
-    // SAFETY: the view's widget.
-    unsafe { (engine.api.webkit_web_view_reload)(gtk) };
-    start_navigation(receiver)
-}
-
-unsafe extern "C" fn reload_action(receiver: Id, sel: Sel, _sender: Id) {
-    unsafe { reload(receiver, sel) };
-}
-
-/// `-loadHTMLString:baseURL:`.
-unsafe extern "C" fn load_html_string(receiver: Id, _sel: Sel, html: Id, base: Id) -> Id {
-    let html = engine::text_of(html);
-    // SAFETY: a URL, or nil.
-    let base = unsafe { foundation::url::text_of(base) }.unwrap_or_default();
-    if let Some((remote, id)) = remote_of(receiver) {
-        let navigation = start_navigation(receiver);
-        remote.send(&["html", &id.to_string(), &html, &host_url(&base)]);
-        return navigation;
-    }
-    let Some((engine, gtk)) = gtk_of(receiver) else {
-        return std::ptr::null_mut();
-    };
-    let navigation = start_navigation(receiver);
-    let (html, base) = (gtk::c_string(&html), gtk::c_string(&host_url(&base)));
-    // SAFETY: the view's widget and two strings it copies.
-    unsafe { (engine.api.webkit_web_view_load_html)(gtk, html.as_ptr(), base.as_ptr()) };
-    navigation
 }
 
 pub fn install() {
@@ -2865,12 +2062,6 @@ pub fn install() {
         "goBack:" => go_back_action, c"v24@0:8@16";
         "goForward:" => go_forward_action, c"v24@0:8@16";
         "URL" => url, c"@16@0:8";
-        "title" => title, c"@16@0:8";
-        "isLoading" => is_loading, c"c16@0:8";
-        "estimatedProgress" => estimated_progress, c"d16@0:8";
-        "reload" => reload, c"@16@0:8";
-        "reload:" => reload_action, c"v24@0:8@16";
-        "loadHTMLString:baseURL:" => load_html_string, c"@32@0:8@16@24";
         "evaluateJavaScript:completionHandler:" => evaluate_javascript, c"v32@0:8@16@?24";
         "customUserAgent" => custom_user_agent, c"@16@0:8";
         "setCustomUserAgent:" => set_custom_user_agent, c"v24@0:8@16";
@@ -2964,7 +2155,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires WebKitGTK and a private compositor; run alone"]
+    #[ignore = "requires WPE WebKit and a private compositor; run alone"]
     fn load_request_sends_custom_headers_to_http_server() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -2973,7 +2164,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         crate::bootstrap();
-        let engine = engine::get().expect("WebKitGTK must start");
+        let engine = engine::get().expect("WPE WebKit must start");
         // SAFETY: registered classes and selectors have these prototypes.
         unsafe {
             let class = objc::class::lookup(c"WKWebView").unwrap();

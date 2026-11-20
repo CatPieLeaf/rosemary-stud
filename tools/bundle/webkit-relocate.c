@@ -1,14 +1,14 @@
 /*
- * WebKitGTK, moved out of the Nix store.
+ * WPE WebKit, moved out of the Nix store.
  *
- * WebKitGTK finds its helper processes, bwrap and xdg-dbus-proxy at paths
+ * WPE WebKit finds its helper processes, bwrap and xdg-dbus-proxy at paths
  * fixed when it was built, and has no run-time override outside developer
- * builds. The bundler adds this library to libwebkitgtk's and
- * libjavascriptcoregtk's DT_NEEDED, ahead of GIO, so their calls into the two
- * spawn functions below come here first, in every process that loads them and
- * without LD_PRELOAD. Each call is passed on with those paths rewritten:
+ * builds. The bundler adds this library to libWPEWebKit's DT_NEEDED, ahead of
+ * GIO, so its calls into the two spawn functions below come here first, in
+ * every process that loads it and without LD_PRELOAD. Each call is passed on
+ * with those paths rewritten:
  *
- *   BAKED_LIBEXEC     -> <root>/libexec/webkitgtk-6.0
+ *   BAKED_LIBEXEC     -> <root>/libexec/wpe-webkit-2.0
  *   BAKED_BWRAP       -> the host's bwrap, else the bundle's copy
  *   BAKED_DBUS_PROXY  -> the host's xdg-dbus-proxy, else the bundle's copy
  *
@@ -97,7 +97,7 @@ static void locate(void)
             return;
         *slash = 0;
     }
-    if (!join(self.libexec, root, "libexec/webkitgtk-6.0") || access(self.libexec, X_OK) != 0
+    if (!join(self.libexec, root, "libexec/wpe-webkit-2.0") || access(self.libexec, X_OK) != 0
         || !join(self.loader, root, "glibc/lib/" LOADER_NAME)
         || !join(bundled_bwrap, self.libexec, "bwrap")
         || !join(bundled_dbus_proxy, self.libexec, "xdg-dbus-proxy"))

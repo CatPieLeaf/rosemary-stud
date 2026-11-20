@@ -26,7 +26,7 @@
     "libwayland-egl.so*" "libX11.so*" "libXext.so*" "libXcursor.so*" "libXi.so*"
     "libXfixes.so*" "libXrandr.so*" "libXrender.so*" "libXss.so*" "libXtst.so*"
   ] ++ (if withWebkit then [
-    # WebKitGTK and GTK link these rather than opening them, so a copy has to
+    # WPE WebKit links these rather than opening them, so a copy has to
     # be there for hosts without them; the host's still comes first.
     "libgbm.so*" "libdrm.so*" "libsystemd.so*" "libudev.so*" "libdbus-1.so*"
     "libxcb*.so*" "libX11-xcb.so*" "libXinerama.so*"
@@ -51,8 +51,8 @@
     # allows, they fail on symbols an older host copy lacks. The client
     # protocol is stable, so the set talks to any PulseAudio or pipewire-pulse.
     "libpulse*"
-    # Left to the host's GTK stack; Rosemary reports the library missing when
-    # the host has none.
-    "libwebkitgtk-*" "libjavascriptcoregtk-*"
+    # Left to the host's; Rosemary reports the library missing when the host
+    # has none.
+    "libWPEWebKit-*"
   ]);
 }

@@ -122,8 +122,8 @@
               # OpenAL: dlopened by the OpenAL.framework bridge.
               pkgs.openal
               # webkit: loaded with dlopen, so it has to be on the library path.
-              pkgs.webkitgtk_6_0
-              # webkit: the compositor WebKitGTK's windows are shown in.
+              pkgs.wpewebkit
+              # webkit: the compositor WPE WebKit's views are shown in.
               pkgs.libxkbcommon
               # NSStatusItem: SDL's tray dlopens an AppIndicator and GTK 3.
               pkgs.libayatana-appindicator
@@ -154,7 +154,7 @@
 
             # mediabackend's gstreamer feature: base has appsrc, appsink and
             # videoconvert, bad has h264parse, and libav has avdec_h264.
-            # Listing them replaces the host's plugin path, and WebKitGTK
+            # Listing them replaces the host's plugin path, and WPE WebKit
             # aborts on any media element without good's autoaudiosink.
             buildInputs = runtimeLibs ++ [
               pkgs.gst_all_1.gstreamer
@@ -164,7 +164,7 @@
               pkgs.gst_all_1.gst-libav
             ];
 
-            # WebKitGTK's network stack finds TLS through a GIO module.
+            # WPE WebKit's network stack finds TLS through a GIO module.
             GIO_EXTRA_MODULES = lib.optionalString pkgs.stdenv.hostPlatform.isLinux
               "${pkgs.glib-networking}/lib/gio/modules";
 

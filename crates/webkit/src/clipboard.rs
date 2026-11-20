@@ -1,15 +1,15 @@
-//! The host's clipboard, as the selection of GTK's private display.
+//! The host's clipboard, as the selection of WPE's private display.
 //!
-//! GTK's clipboard lives in the web view compositor, which no other program
+//! WPE's clipboard lives in the web view compositor, which no other program
 //! can see. What a page copies is moved to the general pasteboard, and the
-//! pasteboard is offered back to GTK before a page can paste.
+//! pasteboard is offered back to WPE before a page can paste.
 
 use std::cell::Cell;
 
 use crate::compositor::Command;
-use crate::compositor::Compositor;
+use crate::engine::Engine;
 
-/// The types GTK asks for text by, all answered with the same bytes.
+/// The types a Wayland client asks for text by, all answered with the same bytes.
 const TEXT_TYPES: &[&str] = &[
     "text/plain;charset=utf-8",
     "UTF8_STRING",
@@ -20,16 +20,16 @@ const TEXT_TYPES: &[&str] = &[
 const HTML_TYPE: &str = "text/html";
 
 thread_local! {
-    /// The pasteboard's change count when GTK last saw its contents, either
-    /// because they were offered or because they came from GTK.
+    /// The pasteboard's change count when WPE last saw its contents, either
+    /// because they were offered or because they came from WPE.
     static SEEN: Cell<Option<isize>> = const { Cell::new(None) };
 }
 
-/// Offer the pasteboard to GTK, unless it already has what is on it.
+/// Offer the pasteboard to WPE, unless it already has what is on it.
 ///
 /// Called when a web view takes the keyboard and just before a paste, rather
 /// than on every turn, because reading the desktop's clipboard can be slow.
-pub fn offer(compositor: &Compositor) {
+pub fn offer(engine: &Engine) {
     let (count, text, html) = appkit::pasteboard::general_text_and_html();
     if SEEN.get() == Some(count) {
         return;
@@ -43,7 +43,7 @@ pub fn offer(compositor: &Compositor) {
         entries.push((HTML_TYPE.to_string(), html));
     }
     if !entries.is_empty() {
-        compositor.send(Command::Offer { entries });
+        engine.compositor.send(Command::Offer { entries });
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "webkit"
-description = "Reimplementation of the WebKit framework over WebKitGTK"
+description = "Reimplementation of the WebKit framework over WPE WebKit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

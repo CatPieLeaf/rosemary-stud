@@ -144,9 +144,9 @@ pub fn add_modal_presentation_hook(hook: fn()) {
 /// Run `hook` on every turn of the main thread's event pump, after input is
 /// delivered and before stores are presented.
 ///
-/// For another toolkit whose own main loop has to turn on this thread: WebKit's
-/// GTK main context is serviced here, so its callbacks reach the guest on the
-/// thread AppKit promises them on.
+/// For another toolkit whose own main loop has to turn on this thread: WPE
+/// WebKit's GLib main context is serviced here, so its callbacks reach the guest
+/// on the thread AppKit promises them on.
 pub fn add_pump_hook(hook: fn()) {
     let mut hooks = PUMP_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
     if !hooks

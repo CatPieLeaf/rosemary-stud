@@ -1,11 +1,11 @@
-//! Mac keys as the Linux evdev codes GTK's keyboard reads.
+//! Mac keys as the Linux evdev codes WPE's keyboard reads.
 //!
 //! The page gets physical keys, and the compositor's xkb keymap turns them
 //! into characters, so a web view types in that keymap's layout.
 
 use appkit::keymap::flags;
 
-/// `KEY_LEFTCTRL`, which Command becomes: GTK's and WebKitGTK's editing
+/// `KEY_LEFTCTRL`, which Command becomes: WPE WebKit's editing
 /// shortcuts are Control ones, and a Mac user reaches them with Command.
 const COMMAND_LEFT: u32 = 29;
 const COMMAND_RIGHT: u32 = 97;

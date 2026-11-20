@@ -20,13 +20,13 @@ pub struct GList {
     pub prev: *mut GList,
 }
 
-/// `GdkRGBA`.
+/// `WebKitColor`.
 #[repr(C)]
-pub struct Rgba {
-    pub red: f32,
-    pub green: f32,
-    pub blue: f32,
-    pub alpha: f32,
+pub struct Color {
+    pub red: f64,
+    pub green: f64,
+    pub blue: f64,
+    pub alpha: f64,
 }
 
 pub const POLICY_DECISION_NAVIGATION_ACTION: c_int = 0;
@@ -72,7 +72,6 @@ macro_rules! api {
 
 api! {
     g_main_context_iteration: fn(Ptr, c_int) -> c_int;
-    g_object_ref_sink: fn(Ptr) -> Ptr;
     g_object_unref: fn(Ptr);
     g_object_ref: fn(Ptr) -> Ptr;
     g_signal_connect_data: fn(Ptr, *const c_char, Ptr, Ptr, Ptr, c_int) -> u64;
@@ -85,30 +84,18 @@ api! {
     g_date_time_to_unix: fn(Ptr) -> i64;
     g_date_time_unref: fn(Ptr);
 
-    gtk_disable_setlocale: fn();
-    gtk_init_check: fn() -> c_int;
-    gtk_window_new: fn() -> Ptr;
-    gtk_window_set_child: fn(Ptr, Ptr);
-    gtk_window_set_decorated: fn(Ptr, c_int);
-    gtk_window_set_default_size: fn(Ptr, c_int, c_int);
-    gtk_window_present: fn(Ptr);
-    gtk_window_destroy: fn(Ptr);
-    gtk_widget_realize: fn(Ptr);
-    gtk_widget_grab_focus: fn(Ptr) -> c_int;
-    gtk_widget_add_css_class: fn(Ptr, *const c_char);
-    gtk_css_provider_new: fn() -> Ptr;
-    gtk_css_provider_load_from_string: fn(Ptr, *const c_char);
-    gtk_style_context_add_provider_for_display: fn(Ptr, Ptr, u32);
-    gtk_widget_get_native: fn(Ptr) -> Ptr;
-    gtk_native_get_surface: fn(Ptr) -> Ptr;
-    gdk_set_allowed_backends: fn(*const c_char);
-    gdk_gl_context_clear_current: fn();
-    gdk_display_manager_get: fn() -> Ptr;
-    gdk_display_manager_get_default_display: fn(Ptr) -> Ptr;
-    gdk_wayland_surface_get_wl_surface: fn(Ptr) -> Ptr;
+    wpe_display_wayland_new: fn() -> Ptr;
+    wpe_display_wayland_connect: fn(Ptr, *const c_char, *mut *mut GError) -> c_int;
+    wpe_display_create_toplevel: fn(Ptr, u32) -> Ptr;
+    wpe_view_get_toplevel: fn(Ptr) -> Ptr;
+    wpe_view_set_toplevel: fn(Ptr, Ptr);
+    wpe_view_map: fn(Ptr);
+    wpe_view_wayland_get_wl_surface: fn(Ptr) -> Ptr;
+    wpe_toplevel_resize: fn(Ptr, c_int, c_int) -> c_int;
     wl_proxy_get_id: fn(Ptr) -> u32;
 
     webkit_web_view_get_type: fn() -> usize;
+    webkit_web_view_get_wpe_view: fn(Ptr) -> Ptr;
     webkit_network_session_new: fn(*const c_char, *const c_char) -> Ptr;
     webkit_network_session_get_cookie_manager: fn(Ptr) -> Ptr;
     webkit_user_content_manager_new: fn() -> Ptr;
@@ -142,7 +129,7 @@ api! {
     webkit_script_dialog_confirm_set_confirmed: fn(Ptr, c_int);
     webkit_web_view_stop_loading: fn(Ptr);
     webkit_web_view_get_uri: fn(Ptr) -> *const c_char;
-    webkit_web_view_set_background_color: fn(Ptr, *const Rgba);
+    webkit_web_view_set_background_color: fn(Ptr, *const Color);
     webkit_web_view_execute_editing_command: fn(Ptr, *const c_char);
     webkit_web_view_evaluate_javascript: fn(Ptr, *const c_char, isize, *const c_char, *const c_char, Ptr, Option<AsyncReady>, Ptr);
     webkit_web_view_evaluate_javascript_finish: fn(Ptr, Ptr, *mut *mut GError) -> Ptr;
@@ -213,42 +200,17 @@ pub fn api() -> Result<&'static Api, &'static str> {
         // callbacks outlive any point at which closing it would be safe.
         let handle = unsafe {
             libc::dlopen(
-                c"libwebkitgtk-6.0.so.4".as_ptr(),
+                c"libWPEWebKit-2.0.so.1".as_ptr(),
                 libc::RTLD_LAZY | libc::RTLD_GLOBAL,
             )
         };
         if handle.is_null() {
-            return Err("libwebkitgtk-6.0.so.4 is not installed");
+            return Err("WPE WebKit (libWPEWebKit-2.0.so.1) is not installed");
         }
         resolve(handle)
     })
     .as_ref()
     .map_err(|missing| *missing)
-}
-
-/// The CSS class every web view's window carries.
-pub const WINDOW_CLASS: &std::ffi::CStr = c"rosemary-web-view";
-
-/// Give web view windows no background of their own, so that a page drawn
-/// without one (`drawsBackground` off) shows what is under the view.
-///
-/// # Safety
-///
-/// `display` must be the `GdkDisplay` GTK runs on.
-pub unsafe fn make_windows_transparent(api: &Api, display: Ptr) {
-    // `GTK_STYLE_PROVIDER_PRIORITY_USER`, above any theme.
-    const PRIORITY: u32 = 800;
-    // SAFETY: a new provider, a NUL-terminated style sheet, and the caller's
-    // display, which keeps its own reference to the provider.
-    unsafe {
-        let provider = (api.gtk_css_provider_new)();
-        (api.gtk_css_provider_load_from_string)(
-            provider,
-            c"window.rosemary-web-view { background: none; box-shadow: none; }".as_ptr(),
-        );
-        (api.gtk_style_context_add_provider_for_display)(display, provider, PRIORITY);
-        (api.g_object_unref)(provider);
-    }
 }
 
 /// A C string the library owns, copied.
