@@ -79,6 +79,7 @@ api! {
     g_error_free: fn(*mut GError);
     g_quark_to_string: fn(u32) -> *const c_char;
     g_free: fn(Ptr);
+    g_set_prgname: fn(*const c_char);
     g_list_free: fn(*mut GList);
     g_date_time_new_from_unix_utc: fn(i64) -> Ptr;
     g_date_time_to_unix: fn(Ptr) -> i64;

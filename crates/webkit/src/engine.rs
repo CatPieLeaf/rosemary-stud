@@ -51,6 +51,12 @@ fn start() -> Result<Engine, String> {
         return Err("disabled by ROSEMARY_WEBKIT=0".to_string());
     }
     let api = wpe::api()?;
+    // WebKit names its sandboxed processes after the program; Flatpak's portal only accepts the app id.
+    if let Some(app_id) = std::env::var_os("FLATPAK_ID") {
+        let app_id = wpe::c_string(&app_id.to_string_lossy());
+        // SAFETY: GLib copies the name.
+        unsafe { (api.g_set_prgname)(app_id.as_ptr()) };
+    }
     let composition = match std::env::var("ROSEMARY_WEBKIT_GPU").as_deref() {
         Ok("0") => Composition::Cpu,
         _ => Composition::Gpu(appkit::backing::importer()),
