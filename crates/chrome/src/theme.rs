@@ -72,6 +72,30 @@ pub struct Theme {
     pub alert_default_pressed: Color,
     pub alert_default_text: Color,
 
+    /// A notification banner, measured from a Catalina one (the Mojave
+    /// design): the titlebar's gradient behind the app's icon, the title in
+    /// semibold and the text under it.
+    pub banner_width: f32,
+    pub banner_corner_radius: f32,
+    /// Left of the icon and between it and the text.
+    pub banner_padding: f32,
+    /// Above and below the icon and the text.
+    pub banner_padding_vertical: f32,
+    pub banner_icon_size: f32,
+    pub banner_title_size: f32,
+    pub banner_text_size: f32,
+    /// From one baseline to the next.
+    pub banner_line_height: f32,
+    pub banner_border: Color,
+    pub banner_text: Color,
+    /// The shadow's darkness where it meets the banner, fading over
+    /// `banner_shadow_radius` outside it, dropped by `banner_shadow_offset`.
+    pub banner_shadow: Color,
+    pub banner_shadow_radius: f32,
+    pub banner_shadow_offset: f32,
+    /// Between the banner and the top and right edges of the window it is in.
+    pub banner_inset: f32,
+
     pub checkbox_size: f32,
     pub checkbox_height: f32,
     pub checkbox_gap: f32,
@@ -143,6 +167,20 @@ impl Theme {
             alert_default: Color::rgb(0x00, 0x7A, 0xFF),
             alert_default_pressed: Color::rgb(0x00, 0x62, 0xD4),
             alert_default_text: Color::rgb(0xFF, 0xFF, 0xFF),
+            banner_width: 345.0,
+            banner_corner_radius: 7.5,
+            banner_padding: 13.0,
+            banner_padding_vertical: 13.0,
+            banner_icon_size: 26.0,
+            banner_title_size: 12.0,
+            banner_text_size: 12.0,
+            banner_line_height: 18.0,
+            banner_border: Color::rgba(0, 0, 0, 0.1),
+            banner_text: Color::rgba(0, 0, 0, 0.85),
+            banner_shadow: Color::rgba(0, 0, 0, 0.12),
+            banner_shadow_radius: 6.0,
+            banner_shadow_offset: 2.0,
+            banner_inset: 16.0,
             checkbox_size: 14.0,
             checkbox_height: 20.0,
             checkbox_gap: 6.0,
@@ -184,6 +222,9 @@ impl Theme {
             alert_button: Color::rgba(255, 255, 255, 0.16),
             alert_button_pressed: Color::rgba(255, 255, 255, 0.28),
             alert_button_text: Color::rgba(255, 255, 255, 0.88),
+            banner_border: Color::rgba(255, 255, 255, 0.1),
+            banner_text: Color::rgba(255, 255, 255, 0.88),
+            banner_shadow: Color::rgba(0, 0, 0, 0.3),
             alert_default: Color::rgb(0x0A, 0x84, 0xFF),
             alert_default_pressed: Color::rgb(0x40, 0x9C, 0xFF),
             checkbox_background: Color::rgb(0x4A, 0x4A, 0x4A),

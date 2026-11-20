@@ -4,7 +4,9 @@
 //! a few views.
 
 pub mod alert;
+pub mod banner;
 pub mod checkbox;
+mod color;
 pub mod corners;
 pub mod fonts;
 pub mod geometry;

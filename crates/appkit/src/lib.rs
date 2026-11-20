@@ -86,6 +86,7 @@ pub(crate) fn render_scale() -> f64 {
 }
 pub mod monitor;
 pub mod nib;
+mod notifications;
 pub mod nsevent;
 pub mod opengl;
 pub mod panel;

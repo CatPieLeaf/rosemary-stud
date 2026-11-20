@@ -18,13 +18,22 @@ const UI_FAMILIES: &[&str] = &[
 ];
 
 /// Families searched for a character the chosen face lacks: the menu glyphs
-/// (command, option, shift) are missing from many interface fonts.
+/// (command, option, shift) are missing from many interface fonts, and emoji
+/// from all of them.
 const FALLBACK_FAMILIES: &[&str] = &[
     "DejaVu Sans",
     "Noto Sans Symbols 2",
     "Noto Sans Symbols",
     "Symbola",
+    "Apple Color Emoji",
+    "Noto Color Emoji",
+    "Twemoji",
+    "Fluent Color Emoji",
+    "Noto Emoji",
 ];
+
+/// A flag is a pair of these, which an emoji font joins into one glyph.
+const REGIONAL_INDICATORS: std::ops::RangeInclusive<char> = '\u{1F1E6}'..='\u{1F1FF}';
 
 /// Outlines by (face, glyph), parsed once.
 type Outlines = HashMap<(usize, u16), Arc<Vec<Segment>>>;
@@ -41,6 +50,37 @@ pub struct Glyph {
     /// Points per font unit.
     pub scale: f32,
     pub advance: f32,
+    /// Set for a colour glyph, an emoji's, drawn in its own colours rather
+    /// than filled from `outline`.
+    pub color: Option<ColorGlyph>,
+}
+
+pub struct ColorGlyph {
+    pub face: Arc<LoadedFace>,
+    pub glyph: GlyphId,
+}
+
+/// The glyph two faces' lookups agree on, from the ligatures in `face`'s
+/// substitution table: how an emoji font joins a flag's pair.
+fn ligature(face: &owned_ttf_parser::Face<'_>, first: GlyphId, second: GlyphId) -> Option<GlyphId> {
+    use owned_ttf_parser::gsub::SubstitutionSubtable;
+    for lookup in face.tables().gsub?.lookups {
+        for subtable in lookup.subtables.into_iter::<SubstitutionSubtable>() {
+            let SubstitutionSubtable::Ligature(ligatures) = subtable else {
+                continue;
+            };
+            let Some(set) = ligatures.coverage.get(first).and_then(|at| ligatures.ligature_sets.get(at)) else {
+                continue;
+            };
+            if let Some(found) = set
+                .into_iter()
+                .find(|l| l.components.len() == 1 && l.components.get(0) == Some(second))
+            {
+                return Some(found.glyph);
+            }
+        }
+    }
+    None
 }
 
 fn exact_family(family: &str, weight: u16) -> Option<FaceInfo> {
@@ -143,11 +183,39 @@ impl Font {
         f32::from(self.faces[face].face().units_per_em().max(1))
     }
 
+    /// The face and glyph each character of `text` is drawn with, a flag's
+    /// pair joined into the one glyph its emoji face has for it; the
+    /// variation selectors that only ask for emoji or text style draw nothing.
+    fn clusters(&self, text: &str) -> Vec<(usize, GlyphId)> {
+        let mut out = Vec::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if matches!(c, '\u{FE0E}' | '\u{FE0F}') {
+                continue;
+            }
+            if REGIONAL_INDICATORS.contains(&c)
+                && let Some(&next) = chars.peek().filter(|n| REGIONAL_INDICATORS.contains(n))
+            {
+                let flag = self.faces.iter().enumerate().find_map(|(index, face)| {
+                    let face = face.face();
+                    let joined = ligature(face, face.glyph_index(c)?, face.glyph_index(next)?)?;
+                    Some((index, joined))
+                });
+                if let Some(flag) = flag {
+                    chars.next();
+                    out.push(flag);
+                    continue;
+                }
+            }
+            out.push(self.lookup(c));
+        }
+        out
+    }
+
     /// The glyphs of `text` at `size` points, in order.
     pub fn glyphs(&self, text: &str, size: f32) -> Vec<Glyph> {
         let mut out = Vec::with_capacity(text.len());
-        for c in text.chars() {
-            let (face, glyph) = self.lookup(c);
+        for (face, glyph) in self.clusters(text) {
             let scale = size / self.units_per_em(face);
             let advance = self.faces[face]
                 .face()
@@ -161,10 +229,15 @@ impl Font {
                     .or_insert_with(|| Arc::new(fonts::outline(self.faces[face].face(), glyph.0)))
                     .clone()
             };
+            let color = self.faces[face].face().is_color_glyph(glyph).then(|| ColorGlyph {
+                face: self.faces[face].clone(),
+                glyph,
+            });
             out.push(Glyph {
                 outline,
                 scale,
                 advance,
+                color,
             });
         }
         out
@@ -172,9 +245,9 @@ impl Font {
 
     /// How far `text` advances at `size` points.
     pub fn measure(&self, text: &str, size: f32) -> f32 {
-        text.chars()
-            .map(|c| {
-                let (face, glyph) = self.lookup(c);
+        self.clusters(text)
+            .into_iter()
+            .map(|(face, glyph)| {
                 let scale = size / self.units_per_em(face);
                 self.faces[face]
                     .face()
@@ -297,5 +370,22 @@ mod tests {
         assert!(one > 0.0);
         assert!((font.measure("mm", 13.0) - 2.0 * one).abs() < 1e-3);
         assert!(font.measure("m", 26.0) > one);
+    }
+
+    #[test]
+    fn a_flag_is_one_colour_glyph_from_the_emoji_face() {
+        let Some(font) = Font::system(400) else {
+            return;
+        };
+        let flag = "\u{1F1E9}\u{1F1EA}";
+        let glyphs = font.glyphs(flag, 13.0);
+        // Hosts without a colour emoji font draw the two letters instead.
+        if glyphs.iter().all(|glyph| glyph.color.is_none()) {
+            return;
+        }
+        assert_eq!(glyphs.len(), 1, "the pair is joined into one flag");
+        assert!((font.measure(flag, 13.0) - glyphs[0].advance).abs() < 1e-3);
+        // The style selector asks for an emoji and draws nothing itself.
+        assert_eq!(font.glyphs("\u{2764}\u{FE0F}", 13.0).len(), 1);
     }
 }

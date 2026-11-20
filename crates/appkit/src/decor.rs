@@ -94,7 +94,7 @@ pub fn config() -> Config {
 /// guest's, so it follows the desktop even though AppKit here answers Aqua.
 static DARK: AtomicBool = AtomicBool::new(false);
 
-fn theme() -> &'static Theme {
+pub(crate) fn theme() -> &'static Theme {
     static LIGHT: OnceLock<Theme> = OnceLock::new();
     static DARK_THEME: OnceLock<Theme> = OnceLock::new();
     match DARK.load(Ordering::Relaxed) {
@@ -723,6 +723,7 @@ pub(crate) fn pump() {
         forget_sdl(sdl as sdl3::Window);
     }
     step_reveal();
+    crate::notifications::step();
 }
 
 /// Drop everything kept for an SDL window, before it is destroyed or when it
@@ -863,6 +864,9 @@ pub(crate) fn pointer_left(id: u32) {
 pub(crate) fn pointer_button(id: u32, button: u8, down: bool, clicks: u8, x: f32, y: f32) -> bool {
     const LEFT: u8 = 1;
     const RIGHT: u8 = 3;
+    if crate::notifications::pointer(id, x, y, down && button == LEFT) {
+        return true;
+    }
     if tracking_popup(id) {
         if !down && button == LEFT {
             tracking_release(id, x, y);

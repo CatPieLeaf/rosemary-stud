@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 owned_ttf_parser.workspace = true
 ab_glyph_rasterizer.workspace = true
+tiny-skia.workspace = true
 rust-fontconfig.workspace = true
 
 [lints]

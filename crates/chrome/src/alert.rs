@@ -116,7 +116,7 @@ impl Alert {
 
 /// Up to `limit` of `lines`, the last marked with an ellipsis when some
 /// were cut.
-fn cap(mut lines: Vec<String>, limit: usize) -> Vec<String> {
+pub(crate) fn cap(mut lines: Vec<String>, limit: usize) -> Vec<String> {
     if lines.len() > limit {
         lines.truncate(limit);
         if let Some(last) = lines.last_mut() {

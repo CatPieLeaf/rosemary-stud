@@ -356,10 +356,23 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn fill_path(&mut self, path: &Path, color: Color) {
+        let device = self.device_segments(path);
+        self.fill_device(&device, |_| color);
+    }
+
+    /// Fill `path` from `top` at `rect`'s top edge to `bottom` at its bottom
+    /// edge, as [`Canvas::fill_vertical_gradient`] fills a rectangle.
+    pub fn fill_path_vertical_gradient(&mut self, path: &Path, rect: Rect, top: Color, bottom: Color) {
+        let s = self.scale;
+        let (start, extent) = (rect.y * s, (rect.height * s).max(1.0));
+        let device = self.device_segments(path);
+        self.fill_device(&device, |y| top.mix(bottom, (y as f32 + 0.5 - start) / extent));
+    }
+
+    fn device_segments(&self, path: &Path) -> Vec<Segment> {
         let s = self.scale;
         let scaled = |p: Point| Point::new(p.x * s, p.y * s);
-        let device: Vec<Segment> = path
-            .segments
+        path.segments
             .iter()
             .map(|segment| match *segment {
                 Segment::Line(a, b) => Segment::Line(scaled(a), scaled(b)),
@@ -368,12 +381,11 @@ impl<'a> Canvas<'a> {
                     Segment::Cubic(scaled(a), scaled(b), scaled(c), scaled(d))
                 }
             })
-            .collect();
-        self.fill_device(&device, color);
+            .collect()
     }
 
-    /// Fill segments already in device pixels.
-    fn fill_device(&mut self, segments: &[Segment], color: Color) {
+    /// Fill segments already in device pixels, each row in its own colour.
+    fn fill_device(&mut self, segments: &[Segment], color_of_row: impl Fn(i32) -> Color) {
         let mut bounds = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         let mut grow = |p: &Point| {
             bounds = (
@@ -427,7 +439,7 @@ impl<'a> Canvas<'a> {
         rasterizer.for_each_pixel_2d(|x, y, coverage| {
             let (x, y) = (x as i32 + path_area.left, y as i32 + path_area.top);
             if x >= clip.left && x < clip.right && y >= clip.top && y < clip.bottom {
-                self.blend(x, y, color, coverage);
+                self.blend(x, y, color_of_row(y), coverage);
             }
         });
     }
@@ -446,6 +458,11 @@ impl<'a> Canvas<'a> {
         let mut pen = origin.x;
         for glyph in font.glyphs(text, size) {
             let x0 = pen;
+            if let Some(colored) = &glyph.color {
+                self.draw_color_glyph(colored, &glyph, Point::new(x0, origin.y), color);
+                pen += glyph.advance;
+                continue;
+            }
             let segments: Vec<Segment> = glyph
                 .outline
                 .iter()
@@ -465,10 +482,35 @@ impl<'a> Canvas<'a> {
                     }
                 })
                 .collect();
-            self.fill_device(&segments, color);
+            self.fill_device(&segments, |_| color);
             pen += glyph.advance;
         }
         pen - origin.x
+    }
+
+    /// An emoji, in its own colours, with its baseline's left end at
+    /// `origin`: painted at this canvas's pixels over the emoji face's own
+    /// ascent and descent, then drawn there.
+    fn draw_color_glyph(&mut self, colored: &crate::text::ColorGlyph, glyph: &crate::text::Glyph, origin: Point, color: Color) {
+        let s = self.scale;
+        let face = colored.face.face();
+        let ascent = f32::from(face.ascender()) * glyph.scale;
+        let descent = -f32::from(face.descender()) * glyph.scale;
+        let (left, top) = ((origin.x * s).floor(), ((origin.y - ascent) * s).floor());
+        let width = ((origin.x + glyph.advance) * s).ceil() - left;
+        let height = ((origin.y + descent) * s).ceil() - top;
+        if width < 1.0 || height < 1.0 {
+            return;
+        }
+        // Font units, y up, to the image's pixels, y down.
+        let units = glyph.scale * s;
+        let transform =
+            tiny_skia::Transform::from_row(units, 0.0, 0.0, -units, origin.x * s - left, origin.y * s - top);
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let foreground = owned_ttf_parser::RgbaColor::new(byte(color.r), byte(color.g), byte(color.b), byte(color.a));
+        if let Some(image) = crate::color::paint(face, colored.glyph, width as u32, height as u32, transform, foreground) {
+            self.draw_image(&image, Rect::new(left / s, top / s, width / s, height / s));
+        }
     }
 
     /// Draw `image` scaled into `rect`, averaging the source pixels under
@@ -659,5 +701,27 @@ mod tests {
             Color::rgb(0, 0, 255),
         );
         assert!(pixels[0] < pixels[12], "blue grows downwards");
+    }
+
+    #[test]
+    fn an_emoji_is_drawn_in_its_own_colours() {
+        let Some(font) = Font::system(400) else {
+            return;
+        };
+        let flag = "\u{1F1E9}\u{1F1EA}";
+        if font.glyphs(flag, 26.0).iter().all(|glyph| glyph.color.is_none()) {
+            return;
+        }
+        let (width, height) = (60, 40);
+        let mut pixels = vec![0u8; width * height * 4];
+        let mut canvas = Canvas::new(&mut pixels, width, height, width * 4, 1.0);
+        canvas.draw_text(flag, &font, 26.0, Point::new(2.0, 30.0), Color::rgb(0, 0, 0));
+        // Germany's flag: red and gold among the pixels, not just the black
+        // the text was asked for.
+        let coloured = pixels
+            .chunks(4)
+            .filter(|p| p[3] > 200 && (i32::from(p[2]) - i32::from(p[0])).abs() > 80)
+            .count();
+        assert!(coloured > 20, "the flag keeps its colours ({coloured} coloured pixels)");
     }
 }
