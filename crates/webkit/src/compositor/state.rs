@@ -474,6 +474,10 @@ impl State {
                 self.arm_frames(surface);
             }
             Command::Taken { surface } => self.arm_frames(surface),
+            Command::Release { surface, done } => {
+                self.answer_frames(surface);
+                let _ = done.send(());
+            }
             Command::Forget { surface } => {
                 self.early.remove(&surface);
                 if self.keyboard_window == Some(surface) {
@@ -756,8 +760,7 @@ impl State {
     /// has been taken; taking it sends `Command::Taken`, which comes back
     /// here.
     fn release_frames(&mut self, window: SurfaceId) {
-        let time = self.time();
-        let Some(entry) = self.windows.get_mut(&window) else {
+        let Some(entry) = self.windows.get(&window) else {
             return;
         };
         if entry.configure.is_some_and(|c| c.suspended)
@@ -765,6 +768,15 @@ impl State {
         {
             return;
         }
+        self.answer_frames(window);
+    }
+
+    /// Answer `window`'s frame callbacks now.
+    fn answer_frames(&mut self, window: SurfaceId) {
+        let time = self.time();
+        let Some(entry) = self.windows.get_mut(&window) else {
+            return;
+        };
         let root = entry.toplevel.wl_surface();
         let popups: Vec<WlSurface> = PopupManager::popups_for_surface(root)
             .map(|(popup, _)| popup.wl_surface().clone())

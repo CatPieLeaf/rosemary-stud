@@ -77,6 +77,12 @@ pub enum Command {
     },
     /// The last frame of `surface` was taken, so it may draw the next.
     Taken { surface: SurfaceId },
+    /// A new web process draws `surface` next: answer its frame callbacks
+    /// now, taken or not, then tell `done`.
+    Release {
+        surface: SurfaceId,
+        done: std::sync::mpsc::Sender<()>,
+    },
     /// The view is gone; drop anything held for its surface.
     Forget { surface: SurfaceId },
     /// The pointer is at `x`, `y` in the window's logical pixels.

@@ -308,6 +308,28 @@ fn a_toplevel_is_drawn_throttled_and_given_input() {
     }
     until(&mut queue, &mut client, |c| c.frame_done);
 
+    // A release answers a held callback at once, before the frame is taken.
+    client.frame_done = false;
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.frame(&handle, ());
+    surface.commit();
+    queue.roundtrip(&mut client).expect("roundtrip");
+    assert!(!client.frame_done, "the callback was not held");
+    let (done, answered) = std::sync::mpsc::channel();
+    compositor.send(Command::Release { surface: id, done });
+    answered.recv().expect("the release is answered");
+    queue.roundtrip(&mut client).expect("roundtrip");
+    assert!(client.frame_done, "the release left the callback unanswered");
+    let started = Instant::now();
+    while compositor.take_frame(id).is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no third frame"
+        );
+        queue.roundtrip(&mut client).expect("roundtrip");
+    }
+
     compositor.send(Command::Pointer {
         surface: id,
         x: 1.0,

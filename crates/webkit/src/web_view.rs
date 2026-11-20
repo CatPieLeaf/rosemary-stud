@@ -691,7 +691,10 @@ unsafe extern "C" fn load_changed(page: Ptr, event: c_int, data: Ptr) {
     }
     match event {
         wpe::LOAD_STARTED => notify(&view, id, "webView:didStartProvisionalNavigation:"),
-        wpe::LOAD_COMMITTED => notify(&view, id, "webView:didCommitNavigation:"),
+        wpe::LOAD_COMMITTED => {
+            answer_held_frames(id);
+            notify(&view, id, "webView:didCommitNavigation:");
+        }
         wpe::LOAD_FINISHED => {
             notify(&view, id, "webView:didFinishNavigation:");
             finish_navigation(id);
@@ -759,8 +762,32 @@ unsafe extern "C" fn load_failed(
     1
 }
 
+/// A commit may hand the page to a new web process, which draws at once. WPE
+/// aborts if that frame comes while the last one's callback is unanswered, so
+/// the compositor answers it and WPE reads the answer before the frame.
+fn answer_held_frames(id: usize) {
+    let Some(engine) = engine::get() else {
+        return;
+    };
+    let Some(surface) = with_view(id, |v| v.surface).filter(|s| *s != 0) else {
+        return;
+    };
+    let (done, answered) = std::sync::mpsc::channel();
+    engine.compositor.send(Command::Release { surface, done });
+    if answered.recv().is_err() {
+        return;
+    }
+    // SAFETY: WPE's display, on its thread; its event source finishes reading
+    // before any signal handler runs.
+    unsafe {
+        let display = (engine.api.wpe_display_wayland_get_wl_display)(engine.display as Ptr);
+        (engine.api.wl_display_roundtrip)(display);
+    }
+}
+
 unsafe extern "C" fn web_process_terminated(_page: Ptr, reason: c_int, data: Ptr) {
     eprintln!("rosemary: webkit: the web process terminated (reason {reason})");
+    answer_held_frames(data as usize);
     let Some(view) = delegates(data as usize) else {
         return;
     };

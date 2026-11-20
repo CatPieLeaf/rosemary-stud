@@ -94,6 +94,8 @@ api! {
     wpe_view_wayland_get_wl_surface: fn(Ptr) -> Ptr;
     wpe_toplevel_resize: fn(Ptr, c_int, c_int) -> c_int;
     wl_proxy_get_id: fn(Ptr) -> u32;
+    wpe_display_wayland_get_wl_display: fn(Ptr) -> Ptr;
+    wl_display_roundtrip: fn(Ptr) -> c_int;
 
     webkit_web_view_get_type: fn() -> usize;
     webkit_web_view_get_wpe_view: fn(Ptr) -> Ptr;
