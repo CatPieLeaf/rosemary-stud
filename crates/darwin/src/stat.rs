@@ -841,32 +841,43 @@ pub unsafe extern "C" fn fstatat(
 /// archive extraction (`unzip`) relies on it, so it is kept rather than dropped.
 pub(crate) mod beneath {
     use super::Stat;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     use super::{Found, as_seen};
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     use std::ffi::CStr;
     #[cfg(target_os = "linux")]
     use std::ffi::CString;
     use std::ffi::{c_char, c_int};
 
     /// Darwin's `AT_RESOLVE_BENEATH` and `O_RESOLVE_BENEATH`.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     const AT_RESOLVE_BENEATH: c_int = 0x2000;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     const O_RESOLVE_BENEATH: c_int = 0x1000;
+
+    /// The host's own flags. FreeBSD has both, `O_RESOLVE_BENEATH` under a
+    /// number of its own.
+    #[cfg(target_os = "macos")]
+    const HOST_AT_RESOLVE_BENEATH: c_int = AT_RESOLVE_BENEATH;
+    #[cfg(target_os = "macos")]
+    const HOST_O_RESOLVE_BENEATH: c_int = O_RESOLVE_BENEATH;
+    #[cfg(target_os = "freebsd")]
+    const HOST_AT_RESOLVE_BENEATH: c_int = libc::AT_RESOLVE_BENEATH;
+    #[cfg(target_os = "freebsd")]
+    const HOST_O_RESOLVE_BENEATH: c_int = libc::O_RESOLVE_BENEATH;
 
     /// The `AT_` flag where the host can honour it, and no bits elsewhere, so
     /// the caller's check refuses it by `EINVAL` there.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub const SUPPORTED: c_int = AT_RESOLVE_BENEATH;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub const SUPPORTED: c_int = 0;
 
     /// `O_RESOLVE_BENEATH`, likewise: elsewhere it stays an unknown bit that
     /// `open` refuses by name.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub const O_SUPPORTED: c_int = O_RESOLVE_BENEATH;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub const O_SUPPORTED: c_int = 0;
 
     /// `openat` beneath `dirfd` with host `flags`, by the host's own flag.
@@ -874,10 +885,10 @@ pub(crate) mod beneath {
     /// # Safety
     ///
     /// `path` is a NUL-terminated host path.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub unsafe fn open(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_int) -> c_int {
         // SAFETY: the caller's path; `mode` is read only under `O_CREAT`.
-        unsafe { libc::openat(dirfd, path, flags | O_RESOLVE_BENEATH, mode) }
+        unsafe { libc::openat(dirfd, path, flags | HOST_O_RESOLVE_BENEATH, mode) }
     }
 
     /// `fstatat` beneath `dirfd`, by the host's own flag.
@@ -886,7 +897,7 @@ pub(crate) mod beneath {
     ///
     /// `path` is a NUL-terminated host path and `out` is null or a writable
     /// Darwin `struct stat`.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub unsafe fn fstatat(
         dirfd: c_int,
         path: *const c_char,
@@ -900,8 +911,14 @@ pub(crate) mod beneath {
         };
         let mut host: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: the caller's path and a live `stat`.
-        let rc =
-            unsafe { libc::fstatat(dirfd, path, &mut host, AT_RESOLVE_BENEATH | nofollow_flag) };
+        let rc = unsafe {
+            libc::fstatat(
+                dirfd,
+                path,
+                &mut host,
+                HOST_AT_RESOLVE_BENEATH | nofollow_flag,
+            )
+        };
         if rc == 0 && !out.is_null() {
             // SAFETY: the caller states `out` is writable, and `path` was
             // found beneath `dirfd`.
@@ -915,10 +932,30 @@ pub(crate) mod beneath {
     /// # Safety
     ///
     /// `path` is a NUL-terminated host path.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub unsafe fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+        // FreeBSD refuses a last `..` before it checks where it leads, with
+        // `EPERM` or `EINVAL`. Removing one always fails, so asking the way
+        // there first only decides which error an escape is told.
+        #[cfg(target_os = "freebsd")]
+        if ends_in_dot_dot(unsafe { CStr::from_ptr(path) }.to_bytes()) {
+            let mut host: libc::stat = unsafe { std::mem::zeroed() };
+            let flags = HOST_AT_RESOLVE_BENEATH | libc::AT_SYMLINK_NOFOLLOW;
+            // SAFETY: the caller's path and a live `stat`.
+            if unsafe { libc::fstatat(dirfd, path, &mut host, flags) } < 0 {
+                return -1;
+            }
+        }
         // SAFETY: the caller's path.
-        unsafe { libc::unlinkat(dirfd, path, flags | AT_RESOLVE_BENEATH) }
+        unsafe { libc::unlinkat(dirfd, path, flags | HOST_AT_RESOLVE_BENEATH) }
+    }
+
+    /// Whether the last component of `path` is `..`, trailing slashes aside.
+    #[cfg(target_os = "freebsd")]
+    fn ends_in_dot_dot(path: &[u8]) -> bool {
+        let end = path.iter().rposition(|b| *b != b'/').map_or(0, |at| at + 1);
+        let path = &path[..end];
+        path == b".." || path.ends_with(b"/..")
     }
 
     /// `openat2` beneath `dirfd` with host `flags`.
@@ -947,7 +984,7 @@ pub(crate) mod beneath {
         fd as c_int
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub unsafe fn open(_: c_int, _: *const c_char, _: c_int, _: c_int) -> c_int {
         unreachable!("O_SUPPORTED is zero here, so nothing asks for it")
     }
@@ -992,7 +1029,7 @@ pub(crate) mod beneath {
         rc
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub unsafe fn fstatat(_: c_int, _: *const c_char, _: *mut Stat, _: bool) -> c_int {
         unreachable!("SUPPORTED is zero here, so nothing asks for it")
     }
@@ -1046,7 +1083,7 @@ pub(crate) mod beneath {
         rc
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub unsafe fn unlinkat(_: c_int, _: *const c_char, _: c_int) -> c_int {
         unreachable!("SUPPORTED is zero here, so nothing asks for it")
     }
@@ -1587,7 +1624,7 @@ mod tests {
 
     /// `unzip` looks up and opens every path it extracts beneath its target
     /// directory this way, and refuses to extract when the lookup fails.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn resolve_beneath_finds_what_is_inside_and_refuses_what_is_not() {
         const AT_RESOLVE_BENEATH: c_int = 0x2000;
@@ -1637,7 +1674,42 @@ mod tests {
         crate::errno::set(0);
     }
 
+    /// The process umask, asked of the kernel where it can say: setting it to
+    /// read it hands that mask to whatever another test creates meanwhile.
+    #[cfg(target_os = "freebsd")]
+    fn umask() -> u32 {
+        let name = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_UMASK,
+            std::process::id() as c_int,
+        ];
+        let mut mask: u16 = 0;
+        let mut size = size_of::<u16>();
+        // SAFETY: a four-word name and a writable `u16` of the size given.
+        let rc = unsafe {
+            libc::sysctl(
+                name.as_ptr(),
+                4,
+                (&raw mut mask).cast(),
+                &mut size,
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0);
+        u32::from(mask)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn umask() -> u32 {
+        let status = std::fs::read_to_string("/proc/self/status").expect("this process's status");
+        let line = status.lines().find_map(|line| line.strip_prefix("Umask:"));
+        u32::from_str_radix(line.expect("a Umask line").trim(), 8).expect("octal")
+    }
+
     /// The process umask, restored immediately after reading it.
+    #[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
     fn umask() -> u32 {
         // SAFETY: `umask` cannot fail and the second call restores the first.
         unsafe {

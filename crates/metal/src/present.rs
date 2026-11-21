@@ -1382,9 +1382,12 @@ fn present_inner(drawable: Id) {
 
 /// Where a layer sits in its window, or `None` for a layer no view holds.
 /// `ROSEMARY_PRESENT_READBACK`, read once: presentation asks every frame.
+/// The virtual desktop composites pixels and has no surface to present to,
+/// so every frame is read back for it as well.
 fn forced_readback() -> bool {
     #[static_init::dynamic]
-    static FORCED: bool = std::env::var_os("ROSEMARY_PRESENT_READBACK").is_some();
+    static FORCED: bool =
+        std::env::var_os("ROSEMARY_PRESENT_READBACK").is_some() || sdl3::desktop::active();
     *FORCED
 }
 
@@ -1396,7 +1399,7 @@ fn forced_readback() -> bool {
 fn readback_for(window: sdl3::Window) -> bool {
     #[static_init::dynamic]
     static MAIN_ONLY: bool = std::env::var_os("ROSEMARY_SWAPCHAIN_MAIN_WINDOW_ONLY").is_some();
-    forced_readback() || (*MAIN_ONLY && !appkit::window::is_main_window(window))
+    forced_readback() || (*MAIN_ONLY && !appkit::window::is_remembered_window(window))
 }
 
 pub(crate) fn layer_frame(layer: Id) -> Option<appkit::view::Frame> {

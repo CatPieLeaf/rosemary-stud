@@ -39,7 +39,7 @@ pub(crate) use queue::new_command_queue;
 pub(crate) use retire::Submission;
 
 use ash::vk;
-use metal_translate::ir::{ResourceKind, Stage};
+use metal_translate::ir::ResourceKind;
 use objc::object::Id;
 use objc::sel::Sel;
 use std::sync::atomic::Ordering;
@@ -51,7 +51,7 @@ use crate::gpu::{
 use crate::object::{self, methods};
 use crate::pipeline::{
     BUFFER_SET, ComputePipeline, DepthStencilKey, Layouts, RenderDynamicState, RenderPipeline,
-    RenderVariantKey, SETS, binding_type,
+    RenderVariantKey, SETS, STAGES, SlotSet, Table, binding_type, stage_slot,
 };
 use crate::resource::{Buffer, DepthStencilState, SamplerState, Texture};
 use crate::stats::{self, Counter};
@@ -60,9 +60,11 @@ use crate::stats::{self, Counter};
 pub(crate) static TEST_RECORDED_BARRIERS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Metal's per-stage binding tables. Index by `Stage::ordinal`.
-const STAGES: usize = 3;
+/// The slots of each of a stage's binding tables. Index the tables by
+/// `stage_slot`.
 const SLOTS: usize = 32;
+// `Encoder::dirty` has a bit for every slot.
+const _: () = assert!(SLOTS <= SlotSet::CAPACITY);
 
 /// A bound buffer, resolved to its Vulkan handle when it is bound so a draw
 /// does not reach through the object for it.
@@ -308,8 +310,9 @@ pub(crate) struct Encoder {
     /// `MTLDispatchTypeConcurrent`: dispatches may overlap, and the guest
     /// orders them with memory barriers. Every other compute encoder is serial.
     concurrent: bool,
-    /// Whether a full memory barrier follows everything this encoder recorded.
-    barrier_is_last: std::cell::Cell<bool>,
+    /// What orders the work this encoder recorded last against what it
+    /// records next.
+    ordered: std::cell::Cell<Ordered>,
     compute_pipeline: Id,
     render_pipeline: Id,
     depth_state: Id,
@@ -355,16 +358,23 @@ pub(crate) struct Encoder {
     /// The pipeline variant the last draw or dispatch used, with the state
     /// which chose it, so a run of draws with one state asks no cache.
     render_variant: Option<(Id, RenderVariantKey, vk::Pipeline, RenderDynamicState)>,
+    /// Whether the pipeline, depth/stencil or raster state was set since
+    /// `render_variant` was chosen. The pass's resolves, which the variant
+    /// also depends on, are fixed before the first draw.
+    variant_stale: bool,
     /// The per-draw state this encoder last recorded, where the device sets
     /// it per draw; `None` until the first draw, as nothing is inherited.
     render_dynamic: Option<RenderDynamicState>,
     compute_variant: Option<(Id, [u32; 3], vk::Pipeline)>,
     /// A render encoder's attachment images, all of them written.
     attachments: Vec<(vk::Image, vk::ImageAspectFlags)>,
-    /// Whether this encoder may write anything but its attachments: a
-    /// resource a shader writes, a resolve copy, query results, an attachment
-    /// whose memory another resource can share. It then waits for every
-    /// earlier pass and ends with a barrier over all memory.
+    /// The tracked images a blit encoder's copies wrote and read.
+    copies: Hazards,
+    /// Whether this encoder may write anything but its attachments or
+    /// tracked images: a resource a shader writes, a resolve copy, query
+    /// results, an attachment whose memory another resource can share, a
+    /// copy to a buffer. It then waits for all the work before it and ends
+    /// with a barrier over all memory.
     writes_elsewhere: bool,
     /// Index by `bind_point_slot`.
     bound: [BindPoint; 2],
@@ -373,6 +383,13 @@ pub(crate) struct Encoder {
     set_cache: [SetCache; SETS],
     /// Scratch for the entries a draw needs, kept to avoid an allocation.
     wanted: [Vec<DescriptorEntry>; SETS],
+    /// The layouts of the pipeline whose resources the bind point holds in
+    /// full, or null. The command buffer retains every pipeline bound, so
+    /// the address names one pipeline for as long as the encoder lives.
+    resolved: *const Layouts,
+    /// The binding slots set since `resolved` was bound: a set which reads
+    /// none of them still holds what its next draw needs.
+    dirty: SlotSet,
     /// The buffer set's dynamic offsets for the draw, in binding order.
     dynamic_offsets: Vec<u32>,
     vertex_buffers: [(vk::Buffer, u64); SLOTS],
@@ -489,6 +506,20 @@ impl DescriptorScratch {
         self.image_infos.clear();
         self.texel_views.clear();
     }
+}
+
+/// What orders an encoder's last recorded work against what it records next.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Ordered {
+    /// Nothing: later work may overlap it.
+    Not,
+    /// Nothing yet, but the encoder's next dispatch waits for it: dispatches
+    /// of a serial encoder, or of any after `-memoryBarrierWithScope:`.
+    DispatchesOwed,
+    /// A barrier which orders dispatches.
+    Dispatches,
+    /// A full barrier.
+    All,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

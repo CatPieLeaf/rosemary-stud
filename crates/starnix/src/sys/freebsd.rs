@@ -30,7 +30,7 @@ pub mod memory {
     }
 }
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
 use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::fs::MetadataExt;
@@ -121,7 +121,7 @@ pub fn identity(pid: i32) -> Option<Identity> {
 
 pub fn process(pid: i32) -> Option<Process> {
     let proc = kinfo_proc(pid)?;
-    let (tty_major, tty_minor) = match proc.ki_tdev as u64 {
+    let (tty_major, tty_minor) = match proc.ki_tdev {
         NODEV => (-1, -1),
         dev => (libc::major(dev as _), libc::minor(dev as _)),
     };
@@ -144,7 +144,7 @@ pub fn process(pid: i32) -> Option<Process> {
         sgid: proc.ki_svgid,
         state: state(proc.ki_stat),
         nice: proc.ki_nice as i32,
-        start_sec: proc.ki_start.tv_sec as i64,
+        start_sec: proc.ki_start.tv_sec,
         start_usec: proc.ki_start.tv_usec as i32,
     })
 }
@@ -251,6 +251,10 @@ pub fn region_count(pid: i32) -> Option<u32> {
     regions(pid).ok().map(|regions| regions.len() as u32)
 }
 
+// `<sys/user.h>` flags the libc crate does not declare.
+const KVME_FLAG_SYSVSHM: i32 = 0x0000_0080;
+const KVME_FLAG_POSIXSHM: i32 = 0x0000_0100;
+
 pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
     let bytes = sysctl::bytes(&proc_mib(libc::KERN_PROC_VMMAP, pid))?;
     Ok(vmentries(&bytes)
@@ -260,12 +264,27 @@ pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
             read: entry.kve_protection & libc::KVME_PROT_READ != 0,
             write: entry.kve_protection & libc::KVME_PROT_WRITE != 0,
             execute: entry.kve_protection & libc::KVME_PROT_EXEC != 0,
-            // The map entry does not record `MAP_SHARED`, and nothing beside
-            // it stands for it reliably.
-            shared: false,
+            shared: shared(&entry),
             offset: entry.kve_offset,
         })
         .collect())
+}
+
+/// Whether an entry maps its object `MAP_SHARED`. The map does not record the
+/// flag, but a private mapping of a file or a shared memory object is
+/// copy-on-write, and a shared one is not. A device can only be mapped shared.
+// FIXME (ACCURACY): anonymous memory is never copy-on-write and has no object
+// of its own to name, so a shared anonymous mapping reads as private.
+fn shared(entry: &libc::kinfo_vmentry) -> bool {
+    if matches!(
+        entry.kve_type,
+        libc::KVME_TYPE_DEVICE | libc::KVME_TYPE_MGTDEVICE
+    ) {
+        return true;
+    }
+    let object = entry.kve_type == libc::KVME_TYPE_VNODE
+        || entry.kve_flags & (KVME_FLAG_POSIXSHM | KVME_FLAG_SYSVSHM) != 0;
+    object && entry.kve_flags & libc::KVME_FLAG_COW == 0
 }
 
 /// FreeBSD's audit ids are behind `getaudit_addr`, which needs the audit
@@ -399,37 +418,133 @@ pub fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__error() }
 }
 
-// FIXME (PORTABILITY): FreeBSD keeps these with `extattr_*`, not wired up yet.
+/// The only namespace [`xattr_name`] lets through.
+const NAMESPACE: libc::c_int = libc::EXTATTR_NAMESPACE_USER;
 
-pub fn xattr_get_fd(_: RawFd, _: &std::ffi::CStr, _: &mut [u8]) -> io::Result<usize> {
-    Err(io::ErrorKind::Unsupported.into())
+/// The file an attribute is on: an open descriptor, or a path and whether a
+/// final symlink is followed.
+#[derive(Clone, Copy)]
+enum XattrFile<'a> {
+    Fd(RawFd),
+    Path(&'a CStr, bool),
 }
 
-pub fn xattr_get_path(
-    _: &std::ffi::CStr,
-    _: &std::ffi::CStr,
-    _: &mut [u8],
-    _: bool,
-) -> io::Result<usize> {
-    Err(io::ErrorKind::Unsupported.into())
+/// Every attribute this crate is asked for is spelled as Linux does, and only
+/// the `user.` namespace is one a caller may touch without privilege. FreeBSD
+/// carries the namespace beside the name rather than inside it.
+fn xattr_name(name: &CStr) -> io::Result<&CStr> {
+    match name.to_bytes_with_nul().strip_prefix(b"user.") {
+        Some(rest) if rest.len() > 1 => {
+            Ok(CStr::from_bytes_with_nul(rest).map_err(|_| io::ErrorKind::InvalidInput)?)
+        }
+        _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+    }
 }
 
-pub fn xattr_set_fd(_: RawFd, _: &std::ffi::CStr, _: &[u8]) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+/// `extattr_get_*` on `file`: up to `n` bytes into `p`, or the length for a
+/// null `p`.
+///
+/// # Safety
+///
+/// `p` is null or `n` writable bytes.
+unsafe fn xattr_read(file: XattrFile<'_>, name: &CStr, p: *mut c_void, n: usize) -> isize {
+    // SAFETY: NUL-terminated strings, and the caller's buffer.
+    unsafe {
+        match file {
+            XattrFile::Fd(fd) => libc::extattr_get_fd(fd, NAMESPACE, name.as_ptr(), p, n),
+            XattrFile::Path(path, true) => {
+                libc::extattr_get_file(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+            XattrFile::Path(path, false) => {
+                libc::extattr_get_link(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+        }
+    }
 }
 
-pub fn xattr_set_path(_: &std::ffi::CStr, _: &std::ffi::CStr, _: &[u8], _: bool) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+fn xattr_result(rc: isize) -> io::Result<usize> {
+    usize::try_from(rc).map_err(|_| io::Error::last_os_error())
 }
 
-pub fn xattr_remove_fd(_: RawFd, _: &std::ffi::CStr) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+fn xattr_get(file: XattrFile<'_>, name: &CStr, buf: &mut [u8]) -> io::Result<usize> {
+    let name = xattr_name(name)?;
+    // FreeBSD truncates into a short buffer where Linux refuses with `ERANGE`,
+    // and a truncated value reported as a whole one is the answer a caller
+    // cannot tell is wrong: ask for the length first.
+    // SAFETY: a null buffer asks for the length.
+    let length = xattr_result(unsafe { xattr_read(file, name, std::ptr::null_mut(), 0) })?;
+    if buf.is_empty() {
+        return Ok(length);
+    }
+    if length > buf.len() {
+        return Err(io::Error::from_raw_os_error(libc::ERANGE));
+    }
+    // SAFETY: a buffer of its own length.
+    xattr_result(unsafe { xattr_read(file, name, buf.as_mut_ptr().cast(), buf.len()) })
 }
 
-pub fn xattr_remove_path(_: &std::ffi::CStr, _: &std::ffi::CStr, _: bool) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+fn xattr_set(file: XattrFile<'_>, name: &CStr, value: &[u8]) -> io::Result<()> {
+    let name = xattr_name(name)?;
+    let (p, n) = (value.as_ptr().cast(), value.len());
+    // SAFETY: NUL-terminated strings and the value's own bytes.
+    let rc = unsafe {
+        match file {
+            XattrFile::Fd(fd) => libc::extattr_set_fd(fd, NAMESPACE, name.as_ptr(), p, n),
+            XattrFile::Path(path, true) => {
+                libc::extattr_set_file(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+            XattrFile::Path(path, false) => {
+                libc::extattr_set_link(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+        }
+    };
+    xattr_result(rc).map(drop)
 }
 
-pub fn xattr_is_missing(_: &io::Error) -> bool {
-    false
+fn xattr_remove(file: XattrFile<'_>, name: &CStr) -> io::Result<()> {
+    let name = xattr_name(name)?;
+    // SAFETY: NUL-terminated strings.
+    let rc = unsafe {
+        match file {
+            XattrFile::Fd(fd) => libc::extattr_delete_fd(fd, NAMESPACE, name.as_ptr()),
+            XattrFile::Path(path, true) => {
+                libc::extattr_delete_file(path.as_ptr(), NAMESPACE, name.as_ptr())
+            }
+            XattrFile::Path(path, false) => {
+                libc::extattr_delete_link(path.as_ptr(), NAMESPACE, name.as_ptr())
+            }
+        }
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+pub fn xattr_get_fd(fd: RawFd, name: &CStr, buf: &mut [u8]) -> io::Result<usize> {
+    xattr_get(XattrFile::Fd(fd), name, buf)
+}
+
+pub fn xattr_get_path(path: &CStr, name: &CStr, buf: &mut [u8], follow: bool) -> io::Result<usize> {
+    xattr_get(XattrFile::Path(path, follow), name, buf)
+}
+
+pub fn xattr_set_fd(fd: RawFd, name: &CStr, value: &[u8]) -> io::Result<()> {
+    xattr_set(XattrFile::Fd(fd), name, value)
+}
+
+pub fn xattr_set_path(path: &CStr, name: &CStr, value: &[u8], follow: bool) -> io::Result<()> {
+    xattr_set(XattrFile::Path(path, follow), name, value)
+}
+
+pub fn xattr_remove_fd(fd: RawFd, name: &CStr) -> io::Result<()> {
+    xattr_remove(XattrFile::Fd(fd), name)
+}
+
+pub fn xattr_remove_path(path: &CStr, name: &CStr, follow: bool) -> io::Result<()> {
+    xattr_remove(XattrFile::Path(path, follow), name)
+}
+
+pub fn xattr_is_missing(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOATTR)
 }

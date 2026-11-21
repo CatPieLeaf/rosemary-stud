@@ -2642,6 +2642,53 @@ unsafe fn draw(encoder: Id, vertices: u64) {
 /// # Safety
 ///
 /// `encoder` must be an `RosemaryMTLCommandEncoder`.
+unsafe fn copy_buffer_to_texture(encoder: Id, buffer: Id, texture: Id, size: u64) {
+    let sel = objc::sel::get(
+        "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+    );
+    // SAFETY: an object the runtime allocated.
+    let method = unsafe { objc::object::class_of(encoder) }
+        .and_then(|class| class.method(sel))
+        .expect("the selector is registered");
+    // SAFETY: the registered signature.
+    #[allow(clippy::type_complexity)]
+    let call: unsafe extern "C" fn(
+        Id,
+        Sel,
+        Id,
+        u64,
+        u64,
+        u64,
+        encoder::MtlSize,
+        Id,
+        u64,
+        u64,
+        encoder::MtlOrigin,
+    ) = unsafe { std::mem::transmute(method.implementation()) };
+    unsafe {
+        call(
+            encoder,
+            sel,
+            buffer,
+            0,
+            size * 4,
+            size * size * 4,
+            encoder::MtlSize {
+                width: size,
+                height: size,
+                depth: 1,
+            },
+            texture,
+            0,
+            0,
+            encoder::MtlOrigin { x: 0, y: 0, z: 0 },
+        )
+    };
+}
+
+/// # Safety
+///
+/// `encoder` must be an `RosemaryMTLCommandEncoder`.
 unsafe fn copy_texture_to_buffer(encoder: Id, texture: Id, buffer: Id, size: u64) {
     let sel = objc::sel::get(
         "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:",
@@ -3797,6 +3844,94 @@ fn a_pass_overwriting_a_texture_waits_for_the_pass_which_sampled_it() {
         let pixels = fixture.read(command, &[target, sampled]);
         assert_all(&pixels[0], BLUE_PIXEL, "what the first pass sampled");
         assert_all(&pixels[1], RED_PIXEL, "the overwritten texture");
+    }
+}
+
+/// A buffer of [`HAZARD_SIZE`] square `pixel`s.
+fn pixel_buffer(device: Id, pixel: [u8; 4]) -> Id {
+    let pixels = pixel.repeat((HAZARD_SIZE * HAZARD_SIZE) as usize);
+    // SAFETY: a device of this crate's, and bytes which outlive the call.
+    unsafe {
+        new_buffer_with_bytes(
+            device,
+            std::ptr::null(),
+            pixels.as_ptr().cast(),
+            pixels.len(),
+            0,
+        )
+    }
+}
+
+/// A copy to a texture no earlier work touched waits for nothing and ends
+/// its encoder with no barrier. The next pass waits for it as it begins, so
+/// a texture bound after drawing began does not split the pass.
+#[test]
+fn a_copy_nothing_earlier_touched_waits_until_the_next_pass() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let fixture = SamplingDraw::new(device);
+    let blue = fixture.filled(BLUE);
+    let (drawn, uploaded, target) = (fixture.target(), fixture.target(), fixture.target());
+    let red = pixel_buffer(device, RED_PIXEL);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let pass = render_encoder(command, single_target_pass(drawn, LOAD_DONT_CARE, BLUE));
+        fixture.prepare(pass, blue);
+        draw(pass, 3);
+        send_void(pass, "endEncoding");
+        let before = recorded_barriers();
+        let blit = send(command, "blitCommandEncoder");
+        copy_buffer_to_texture(blit, red, uploaded, HAZARD_SIZE);
+        send_void(blit, "endEncoding");
+        assert_eq!(recorded_barriers() - before, 0, "the copy");
+        let pass = render_encoder(command, single_target_pass(target, LOAD_DONT_CARE, BLUE));
+        fixture.prepare(pass, blue);
+        draw(pass, 3);
+        assert_eq!(recorded_barriers() - before, 1, "the pass beginning");
+        fixture.bind(pass, uploaded);
+        draw(pass, 3);
+        send_void(pass, "endEncoding");
+        assert_eq!(
+            recorded_barriers() - before,
+            1,
+            "the pass sampling the copy"
+        );
+        let pixels = fixture.read(command, &[drawn, target]);
+        assert_all(&pixels[0], BLUE_PIXEL, "the pass before the copy");
+        assert_all(&pixels[1], RED_PIXEL, "the pass after the copy");
+    }
+}
+
+/// A copy to a texture an earlier pass sampled waits for that pass, which
+/// sees what the texture held before.
+#[test]
+fn a_copy_over_a_texture_waits_for_the_pass_which_sampled_it() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let fixture = SamplingDraw::new(device);
+    let sampled = fixture.filled(BLUE);
+    let target = fixture.target();
+    let red = pixel_buffer(device, RED_PIXEL);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let pass = render_encoder(command, single_target_pass(target, LOAD_DONT_CARE, RED));
+        fixture.prepare(pass, sampled);
+        draw(pass, 3);
+        send_void(pass, "endEncoding");
+        let before = recorded_barriers();
+        let blit = send(command, "blitCommandEncoder");
+        copy_buffer_to_texture(blit, red, sampled, HAZARD_SIZE);
+        send_void(blit, "endEncoding");
+        assert_eq!(recorded_barriers() - before, 1);
+        let pixels = fixture.read(command, &[target, sampled]);
+        assert_all(&pixels[0], BLUE_PIXEL, "what the pass sampled");
+        assert_all(&pixels[1], RED_PIXEL, "the copied texture");
     }
 }
 
@@ -5100,8 +5235,10 @@ fn compute_encoders_order_subsequent_dispatches() {
     }
 }
 
+/// Each level waits for the blit which made the level before it, and the
+/// encoder ends with no barrier: nothing earlier touched the texture.
 #[test]
-fn generating_mipmaps_ends_a_blit_encoder_with_one_barrier() {
+fn generating_mipmaps_waits_only_between_levels() {
     isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
@@ -5135,7 +5272,7 @@ fn generating_mipmaps_ends_a_blit_encoder_with_one_barrier() {
         send_void(blit, "endEncoding");
         let recorded =
             encoder::TEST_RECORDED_BARRIERS.load(std::sync::atomic::Ordering::Relaxed) - before;
-        assert_eq!(recorded, LEVELS - 1);
+        assert_eq!(recorded, LEVELS - 2);
         send_void(command, "commit");
         send_void(command, "waitUntilCompleted");
         assert_eq!(send_number_result(command, "status"), 4);
@@ -5502,6 +5639,119 @@ fn each_dispatch_reads_its_own_set_bytes_without_push_descriptors() {
     isolate_metal_fixture!();
     if let Some(device) = gpu_device_without_push_descriptors() {
         check_each_dispatch_reads_its_own_bytes(device);
+    }
+}
+
+fn check_dispatches_follow_single_binding_changes(device: Id) {
+    let add = kernel_from_source(
+        device,
+        "kernel void add(device uint* output [[buffer(0)]],\n\
+                         constant uint& amount [[buffer(1)]],\n\
+                         texture2d<uint> source [[texture(0)]]) {\n\
+             output[0] = output[0] + amount + source.read(uint2(0, 0)).x;\n\
+         }",
+        "add",
+    );
+    let scale = kernel_from_source(
+        device,
+        "kernel void scale(device uint* output [[buffer(0)]],\n\
+                           constant uint& amount [[buffer(1)]],\n\
+                           texture2d<uint> source [[texture(0)]]) {\n\
+             output[0] = output[0] + amount * source.read(uint2(0, 0)).x;\n\
+         }",
+        "scale",
+    );
+    const CHOICES: usize = 3;
+    const STEPS: usize = 60;
+    let texels: [u32; CHOICES] = [3, 50, 700];
+    let mut expected = [0u32; CHOICES];
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let textures: [Id; CHOICES] = std::array::from_fn(|at| {
+            let texture =
+                readable_texture(device, TEXTURE_TYPE_2D, PIXEL_FORMAT_R32_UINT, [1, 1, 1]);
+            replace_region(texture, [0, 0, 1, 1], &texels[at].to_ne_bytes(), 4);
+            texture
+        });
+        let outputs: [Id; CHOICES] =
+            std::array::from_fn(|_| new_buffer(device, std::ptr::null(), 16, 0));
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = send(command, "computeCommandEncoder");
+        let (bind, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(encoder, "setTexture:atIndex:");
+        let (mut output, mut texture, mut amount, mut scaled) = (0, 0, 1u32, false);
+        send_with_object(encoder, "setComputePipelineState:", add);
+        set_buffer_at(encoder, outputs[output], 0, 0);
+        set_bytes_named(
+            encoder,
+            "setBytes:length:atIndex:",
+            &amount.to_ne_bytes(),
+            1,
+        );
+        bind(encoder, sel, textures[texture], 0);
+        for step in 0..STEPS {
+            // One binding changes between dispatches, or none at all.
+            match step % 5 {
+                0 => {
+                    texture = (texture + 1) % CHOICES;
+                    bind(encoder, sel, textures[texture], 0);
+                }
+                1 => {
+                    amount += 7;
+                    set_bytes_named(
+                        encoder,
+                        "setBytes:length:atIndex:",
+                        &amount.to_ne_bytes(),
+                        1,
+                    );
+                }
+                2 => {
+                    output = (output + 1) % CHOICES;
+                    set_buffer_at(encoder, outputs[output], 0, 0);
+                }
+                3 => {
+                    scaled = !scaled;
+                    let kernel = if scaled { scale } else { add };
+                    send_with_object(encoder, "setComputePipelineState:", kernel);
+                }
+                _ => {}
+            }
+            dispatch(encoder, 1);
+            expected[output] += match scaled {
+                true => amount * texels[texture],
+                false => amount + texels[texture],
+            };
+        }
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        for at in 0..CHOICES {
+            let contents = object::body::<resource::Buffer>(outputs[at]).inner.contents;
+            assert_eq!(
+                std::ptr::read(contents as *const u32),
+                expected[at],
+                "output {at}"
+            );
+        }
+    }
+}
+
+/// A dispatch which follows a change to one binding, to the pipeline, or to
+/// nothing reads every binding as it was last set.
+#[test]
+fn a_dispatch_reads_each_binding_as_last_set_when_one_changed() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_dispatches_follow_single_binding_changes(device);
+    }
+}
+
+#[test]
+fn a_dispatch_reads_each_binding_as_last_set_without_push_descriptors() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_push_descriptors() {
+        check_dispatches_follow_single_binding_changes(device);
     }
 }
 
