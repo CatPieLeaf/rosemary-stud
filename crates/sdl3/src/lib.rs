@@ -2218,13 +2218,8 @@ pub mod video {
             }
             let mut raw = super::Event::default();
             // Polling pumps, and dispatching configure and frame events can
-            // commit a window. Never waited for: while another thread presents,
-            // this turn reports no events and SDL keeps them for the next one,
-            // rather than the main thread (the game's frame) waiting out a
-            // present the driver may block in for a whole refresh.
-            let Some(commits) = crate::compositor::try_guard() else {
-                return None;
-            };
+            // commit a window.
+            let commits = crate::compositor::guard();
             // SAFETY: a writable event of SDL's own size.
             let polled = unsafe { poll(&mut raw) };
             drop(commits);
