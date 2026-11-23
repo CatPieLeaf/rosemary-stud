@@ -363,6 +363,7 @@ struct Api {
     SDL_SetWindowMouseRect: Option<unsafe extern "C" fn(Window, *const Rect) -> bool>,
     SDL_GetWindowMouseRect: Option<unsafe extern "C" fn(Window) -> *const Rect>,
     SDL_GetModState: Option<unsafe extern "C" fn() -> u16>,
+    SDL_GetKeyboardState: Option<unsafe extern "C" fn(*mut c_int) -> *const bool>,
     SDL_GetKeyFromScancode: Option<unsafe extern "C" fn(u32, u16, bool) -> u32>,
     SDL_SetHint: Option<unsafe extern "C" fn(*const c_char, *const c_char) -> bool>,
     SDL_GetHint: Option<unsafe extern "C" fn(*const c_char) -> *const c_char>,
@@ -609,6 +610,7 @@ fn api() -> Option<&'static Api> {
             SDL_SetWindowMouseRect,
             SDL_GetWindowMouseRect,
             SDL_GetModState,
+            SDL_GetKeyboardState,
             SDL_GetKeyFromScancode,
             SDL_SetHint,
             SDL_GetHint,
@@ -5530,6 +5532,23 @@ pub mod video {
         api()
             .and_then(|a| a.SDL_GetModState)
             .map_or(0, |f| unsafe { f() })
+    }
+
+    /// Whether the key at `scancode` is down, as SDL's keyboard state has it:
+    /// what a focused window has been sent, cleared when focus leaves.
+    pub fn key_down(scancode: u32) -> bool {
+        if crate::desktop::active() {
+            return false;
+        }
+        let Some(f) = api().and_then(|a| a.SDL_GetKeyboardState) else {
+            return false;
+        };
+        let mut count: c_int = 0;
+        // SAFETY: SDL's own array, `count` entries long, alive for the program.
+        let state = unsafe { f(&mut count) };
+        !state.is_null()
+            && (scancode as usize) < count.max(0) as usize
+            && unsafe { *state.add(scancode as usize) }
     }
 
     /// The keycode the current layout produces for `scancode` with `modifiers`
