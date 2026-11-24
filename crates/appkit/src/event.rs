@@ -337,6 +337,9 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
 /// back, and the loop would never wait for input again.
 pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
     use sdl3::video::Event;
+    if tracing() && !matches!(event, Event::MouseMotion { .. }) {
+        eprintln!("rosemary: input: {:.1}ms host {event:?}", trace_ms());
+    }
     if crate::dialog::deliver(&event) {
         key_withheld(&event);
         return;
@@ -1001,6 +1004,9 @@ pub(crate) fn key_withheld(event: &sdl3::video::Event) {
     else {
         return;
     };
+    if tracing() {
+        eprintln!("rosemary: input: {:.1}ms withheld key scancode {scancode} down {down}", trace_ms());
+    }
     if matches!(
         crate::keymap::edit_chord_step(scancode, modifiers, down),
         ChordStep::Leave | ChordStep::EndAfter
@@ -1500,7 +1506,8 @@ pub fn route(window: Id, event: Id) {
             _ => String::new(),
         };
         eprintln!(
-            "rosemary: appkit: -{selector} to {responder:p} ({}){key}",
+            "rosemary: appkit: {:.1}ms -{selector} to {responder:p} ({}){key}",
+            trace_ms(),
             class.map_or("no class", |c| c.name_str()),
         );
     }
@@ -1911,6 +1918,13 @@ pub const TRACE_ENV: &str = "ROSEMARY_TRACE_EVENT";
 pub(crate) fn tracing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(TRACE_ENV).is_some())
+}
+
+/// Milliseconds on one clock for every input trace line, so their order holds
+/// whatever buffers the program's own log.
+pub(crate) fn trace_ms() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
 fn post(id: u32, name: &str) {

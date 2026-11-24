@@ -5921,6 +5921,9 @@ pub mod video {
     /// the call, which is a host too old for the mode rather than a failure to
     /// enter it.
     pub fn set_relative_mouse_mode(window: Window, enabled: bool) -> bool {
+        if std::env::var_os("ROSEMARY_TRACE_EVENT").is_some() {
+            eprintln!("rosemary: input: relative mouse mode {enabled} for window {window:p}");
+        }
         if let Some(done) = crate::desktop::set_relative_mouse_mode(window, enabled) {
             return done;
         }
