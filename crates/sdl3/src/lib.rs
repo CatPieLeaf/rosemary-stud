@@ -4698,7 +4698,8 @@ pub mod video {
         }
     }
 
-    fn refresh_rate_override() -> Option<f32> {
+    /// `ROSEMARY_SCREEN_REFRESH_RATE`, the rate every display reports in place of its own.
+    pub fn refresh_rate_override() -> Option<f32> {
         static RATE: LazyLock<Option<f32>> = LazyLock::new(|| {
             let value = std::env::var("ROSEMARY_SCREEN_REFRESH_RATE").ok()?;
             match value.trim().parse::<f32>() {
