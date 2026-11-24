@@ -1141,7 +1141,13 @@ pub(crate) fn enqueue_input(event: Id) {
     if event.is_null() {
         return;
     }
-    posted_events().push_back(objc::arc::retain(event) as usize);
+    let mut queue = posted_events();
+    if let Some(merged) = queue.back().and_then(|&last| crate::nsevent::coalesced(last as Id, event)) {
+        objc::arc::release(queue.pop_back().expect("just seen") as Id);
+        queue.push_back(objc::arc::retain(merged) as usize);
+        return;
+    }
+    queue.push_back(objc::arc::retain(event) as usize);
 }
 
 /// Put events a tracking loop took back at the front of the queue, in their
