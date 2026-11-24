@@ -55,6 +55,7 @@ pub fn pump(app: Id) -> bool {
         deliver(event);
     }
     note_focus();
+    crate::application::terminate_if_requested();
     sdl3::pointer::service();
     service_presentation();
     // General pump hooks may run guest code and are not modal-safe.
