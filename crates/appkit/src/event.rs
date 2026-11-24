@@ -1492,8 +1492,14 @@ pub fn route(window: Id, event: Id) {
     if tracing() {
         // SAFETY: a live object this runtime allocated.
         let class = unsafe { objc::object::class_of(responder) };
+        let key = match kind {
+            kind::KEY_DOWN | kind::KEY_UP | kind::FLAGS_CHANGED => nsevent::fields_of(event).map_or_else(String::new, |f| {
+                format!(", key {:#04x}{}", f.key_code, if f.repeat { " repeat" } else { "" })
+            }),
+            _ => String::new(),
+        };
         eprintln!(
-            "rosemary: appkit: -{selector} to {responder:p} ({})",
+            "rosemary: appkit: -{selector} to {responder:p} ({}){key}",
             class.map_or("no class", |c| c.name_str()),
         );
     }
