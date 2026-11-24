@@ -3615,6 +3615,7 @@ pub mod video {
             false => create_native_window(title, width, height, flags)?,
         };
         register_live_window(window, None);
+        quit_when_x11_server_goes(window);
         Some(window)
     }
 
@@ -5728,6 +5729,45 @@ pub mod video {
         let handle = unsafe { number(properties, c"SDL.window.x11.window".as_ptr(), 0) };
         (!display.is_null() && handle != 0).then_some((display, handle as u64))
     }
+
+    /// Xlib ends the process with `exit` once its server goes away - gamescope's
+    /// closing, say - which tears it down under the guest's running threads. A
+    /// quit instead, so the program terminates as it would have chosen to.
+    #[cfg(target_os = "linux")]
+    fn quit_when_x11_server_goes(window: Window) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let Some((display, _)) = x11_native_window(window) else {
+            return;
+        };
+        unsafe extern "C" fn server_gone(_display: *mut c_void, _data: *mut c_void) {
+            let Some(push) = api().and_then(|api| api.SDL_PushEvent) else {
+                return;
+            };
+            let mut raw = super::Event::default();
+            raw.bytes[..size_of::<u32>()].copy_from_slice(&event_type::QUIT.to_ne_bytes());
+            // SAFETY: an event of SDL's own size, which SDL copies.
+            unsafe { push(&mut raw) };
+        }
+        ONCE.call_once(|| unsafe {
+            let x11 = libc::dlopen(c"libX11.so.6".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if x11.is_null() {
+                return;
+            }
+            // Since libX11 1.7; an older one keeps its `exit`.
+            let set = libc::dlsym(x11, c"XSetIOErrorExitHandler".as_ptr());
+            if set.is_null() {
+                return;
+            }
+            type Handler = unsafe extern "C" fn(*mut c_void, *mut c_void);
+            type Set = unsafe extern "C" fn(*mut c_void, Option<Handler>, *mut c_void);
+            let set: Set = std::mem::transmute(set);
+            // SAFETY: SDL's live display, and a handler that only queues an event.
+            set(display, Some(server_gone), std::ptr::null_mut());
+        });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn quit_when_x11_server_goes(_window: Window) {}
 
     /// Whether `window`'s X server is Xwayland, which has the `XWAYLAND`
     /// extension: its pointer belongs to the Wayland compositor, so XFixes
