@@ -602,7 +602,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                     (false, false) => kind::KEY_UP,
                 },
                 modifiers: crate::keymap::modifiers(modifiers) | crate::keymap::key_flags(scancode),
-                key_code: crate::keymap::virtual_key(scancode),
+                key_code: crate::keymap::key_code(scancode, key),
                 characters: objc::arc::autorelease(foundation::string::from_str(&text)),
                 repeat,
                 window,

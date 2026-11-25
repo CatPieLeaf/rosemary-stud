@@ -536,6 +536,32 @@ pub fn scancode_of(vk: u16) -> Option<u32> {
         .map(|(scancode, _)| *scancode)
 }
 
+/// The key code a key event reports. Symbols follow the layout, so the key
+/// that types `/` is slash wherever it sits (ABNT2 has it beside Right Shift);
+/// letters and everything else keep their place, as a Mac's do, so movement
+/// keys stay where they are on AZERTY and QWERTZ.
+pub fn key_code(scancode: u32, key: u32) -> u16 {
+    let symbol = match char::from_u32(key) {
+        Some('/') => vk::ANSI_SLASH,
+        Some(';') => vk::ANSI_SEMICOLON,
+        Some('\'') => vk::ANSI_QUOTE,
+        Some('`') => vk::ANSI_GRAVE,
+        Some('[') => vk::ANSI_LEFT_BRACKET,
+        Some(']') => vk::ANSI_RIGHT_BRACKET,
+        Some('\\') => vk::ANSI_BACKSLASH,
+        Some('-') => vk::ANSI_MINUS,
+        Some('=') => vk::ANSI_EQUAL,
+        Some(',') => vk::ANSI_COMMA,
+        Some('.') => vk::ANSI_PERIOD,
+        _ => return virtual_key(scancode),
+    };
+    // A modifier or command chord is about the key's place, not its symbol.
+    match is_modifier(scancode) {
+        true => virtual_key(scancode),
+        false => symbol,
+    }
+}
+
 pub fn virtual_key(scancode: u32) -> u16 {
     let scancode = guest_scancode(command_key(), edit_chord() != 0, scancode);
     VIRTUAL_KEYS
@@ -713,6 +739,22 @@ pub fn characters(code: u32, keycode: u32) -> String {
     char::from_u32(private)
         .map(String::from)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn symbols_follow_the_layout_and_letters_keep_their_place() {
+        // ABNT2: the key beside Right Shift types `/`, the US slash key `;`.
+        assert_eq!(key_code(scancode::INTERNATIONAL1, '/' as u32), vk::ANSI_SLASH);
+        assert_eq!(key_code(scancode::SLASH, ';' as u32), vk::ANSI_SEMICOLON);
+        // AZERTY: the key in W's place types `z`, and stays W.
+        assert_eq!(key_code(scancode::W, 'z' as u32), vk::ANSI_W);
+        // A key typing nothing the table knows keeps its place.
+        assert_eq!(key_code(scancode::SEMICOLON, 'ç' as u32), virtual_key(scancode::SEMICOLON));
+    }
 }
 
 #[cfg(test)]
