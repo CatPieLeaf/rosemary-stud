@@ -539,9 +539,14 @@ pub fn scancode_of(vk: u16) -> Option<u32> {
 /// The key code a key event reports. Symbols follow the layout, so the key
 /// that types `/` is slash wherever it sits (ABNT2 has it beside Right Shift);
 /// letters and everything else keep their place, as a Mac's do, so movement
-/// keys stay where they are on AZERTY and QWERTZ.
-pub fn key_code(scancode: u32, key: u32) -> u16 {
-    let symbol = match char::from_u32(key) {
+/// keys stay where they are on AZERTY and QWERTZ. AltGr's symbols count too
+/// (ABNT2 types `/` with AltGr+Q); Shift's do not, its key is the unshifted one.
+pub fn key_code(scancode: u32, key: u32, sdl_modifiers: u16) -> u16 {
+    let key = match sdl_modifiers & keymod::MODE {
+        0 => key,
+        _ => typed_key(scancode, key, sdl_modifiers & !keymod::SHIFT),
+    };
+    let symbol = match char::from_u32(keypad_character(key).unwrap_or(key)) {
         Some('/') => vk::ANSI_SLASH,
         Some(';') => vk::ANSI_SEMICOLON,
         Some('\'') => vk::ANSI_QUOTE,
@@ -560,6 +565,21 @@ pub fn key_code(scancode: u32, key: u32) -> u16 {
         true => virtual_key(scancode),
         false => symbol,
     }
+}
+
+/// The character a numpad symbol key types: SDL names numpad keys by their
+/// place (`SDLK_KP_*`, the scancode with bit 30 set), not by their character.
+fn keypad_character(key: u32) -> Option<u32> {
+    const SCANCODE_KEY: u32 = 1 << 30;
+    let character = match key.checked_sub(SCANCODE_KEY)? {
+        scancode::KP_DIVIDE => '/',
+        scancode::KP_MINUS => '-',
+        scancode::KP_EQUALS => '=',
+        scancode::KP_COMMA => ',',
+        scancode::KP_PERIOD | scancode::KP_DECIMAL => '.',
+        _ => return None,
+    };
+    Some(character as u32)
 }
 
 pub fn virtual_key(scancode: u32) -> u16 {
@@ -748,12 +768,15 @@ mod layout_tests {
     #[test]
     fn symbols_follow_the_layout_and_letters_keep_their_place() {
         // ABNT2: the key beside Right Shift types `/`, the US slash key `;`.
-        assert_eq!(key_code(scancode::INTERNATIONAL1, '/' as u32), vk::ANSI_SLASH);
-        assert_eq!(key_code(scancode::SLASH, ';' as u32), vk::ANSI_SEMICOLON);
+        assert_eq!(key_code(scancode::INTERNATIONAL1, '/' as u32, 0), vk::ANSI_SLASH);
+        assert_eq!(key_code(scancode::SLASH, ';' as u32, 0), vk::ANSI_SEMICOLON);
         // AZERTY: the key in W's place types `z`, and stays W.
-        assert_eq!(key_code(scancode::W, 'z' as u32), vk::ANSI_W);
+        assert_eq!(key_code(scancode::W, 'z' as u32, 0), vk::ANSI_W);
+        // The numpad's slash is slash too; its digits keep their place.
+        assert_eq!(key_code(scancode::KP_DIVIDE, (1 << 30) | scancode::KP_DIVIDE, 0), vk::ANSI_SLASH);
+        assert_eq!(key_code(scancode::KP_1, (1 << 30) | scancode::KP_1, 0), virtual_key(scancode::KP_1));
         // A key typing nothing the table knows keeps its place.
-        assert_eq!(key_code(scancode::SEMICOLON, 'ç' as u32), virtual_key(scancode::SEMICOLON));
+        assert_eq!(key_code(scancode::SEMICOLON, 'ç' as u32, 0), virtual_key(scancode::SEMICOLON));
     }
 }
 
