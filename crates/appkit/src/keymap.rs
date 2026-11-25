@@ -567,11 +567,17 @@ pub fn key_code(scancode: u32, key: u32, sdl_modifiers: u16) -> u16 {
     }
 }
 
-/// The character a numpad symbol key types: SDL names numpad keys by their
-/// place (`SDLK_KP_*`, the scancode with bit 30 set), not by their character.
+/// The character a numpad key types: SDL names numpad keys by their place
+/// (`SDLK_KP_*`, the scancode with bit 30 set), not by their character.
 fn keypad_character(key: u32) -> Option<u32> {
     const SCANCODE_KEY: u32 = 1 << 30;
     let character = match key.checked_sub(SCANCODE_KEY)? {
+        digit @ scancode::KP_1..=scancode::KP_9 => {
+            return Some('1' as u32 + digit - scancode::KP_1);
+        }
+        scancode::KP_0 => '0',
+        scancode::KP_MULTIPLY => '*',
+        scancode::KP_PLUS => '+',
         scancode::KP_DIVIDE => '/',
         scancode::KP_MINUS => '-',
         scancode::KP_EQUALS => '=',
@@ -735,6 +741,7 @@ pub fn typed_key(scancode: u32, keycode: u32, sdl_modifiers: u16) -> u32 {
 /// the same values it would on Apple's - and a key with neither is the empty
 /// string, which is what AppKit gives for a modifier.
 pub fn characters(code: u32, keycode: u32) -> String {
+    let keycode = keypad_character(keycode).unwrap_or(keycode);
     if let Some(c) = char::from_u32(keycode).filter(|c| !c.is_control()) {
         return c.to_string();
     }
@@ -775,6 +782,9 @@ mod layout_tests {
         // The numpad's slash is slash too; its digits keep their place.
         assert_eq!(key_code(scancode::KP_DIVIDE, (1 << 30) | scancode::KP_DIVIDE, 0), vk::ANSI_SLASH);
         assert_eq!(key_code(scancode::KP_1, (1 << 30) | scancode::KP_1, 0), virtual_key(scancode::KP_1));
+        // The numpad types its characters, as a Mac's does.
+        assert_eq!(characters(scancode::KP_DIVIDE, (1 << 30) | scancode::KP_DIVIDE), "/");
+        assert_eq!(characters(scancode::KP_7, (1 << 30) | scancode::KP_7), "7");
         // A key typing nothing the table knows keeps its place.
         assert_eq!(key_code(scancode::SEMICOLON, 'ç' as u32, 0), virtual_key(scancode::SEMICOLON));
     }
